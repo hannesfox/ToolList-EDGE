@@ -1,36 +1,58 @@
+import sys
 import os
 import re
 import xml.etree.ElementTree as ET
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 
-# Bildverarbeitung importieren (Pillow)
-try:
-    from PIL import Image, ImageTk
-except ImportError:
-    messagebox.showerror("Fehlendes Modul",
-                         "Das Modul 'Pillow' fehlt.\nBitte öffne dein Terminal und installiere es mit:\n\npip install pillow")
-    raise
+# 1. WICHTIG: PyQt5 muss registriert werden, BEVOR qt_material importiert wird!
+os.environ['QT_API'] = 'pyqt5'
+import PyQt5
+from PyQt5 import QtCore, QtGui, QtWidgets, QtSvg
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QStackedWidget,
+    QFrame, QSizePolicy
+)
+from PyQt5.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent
+from PyQt5.QtCore import Qt
+
+from qt_material import apply_stylesheet
+
 
 # ==============================================================================
-# KONFIGURATION
+#      KONFIGURATION & PFADE
 # ==============================================================================
-DEFAULT_FILE_PATH = "EDGE-Werkzeugliste-2026.gdml"
-IMAGE_DIR = "images"
+def get_base_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
 
-def format_number(val):
-    if val is None or val == '':
-        return ''
+BASE_DIR = get_base_dir()
+DEFAULT_FILE_PATH = os.path.join(BASE_DIR, "EDGE-Werkzeugliste-2026.gdml")
+IMAGE_DIR = os.path.join(BASE_DIR, "images")
+
+
+def resource_path(relative_path: str) -> str:
     try:
-        val_str = str(val).replace(',', '.')
-        num = float(val_str)
-        return f"{num:.3f}"
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = BASE_DIR
+    return os.path.join(base_path, relative_path)
+
+
+# ==============================================================================
+#      GDML PARSER
+# ==============================================================================
+def format_number(val):
+    if val is None or val == '': return ''
+    try:
+        return f"{float(str(val).replace(',', '.')):.3f}"
     except (ValueError, TypeError):
         return str(val)
 
 
-# --- Hilfsfunktionen für die tolerante Suche ---
 def normalize_str(s):
     return str(s).lower().replace(',', '.')
 
@@ -43,19 +65,14 @@ def parse_technology_block(text):
     result = {}
     lines = text.splitlines()
     string_keys = []
-
     for line in lines:
         line = line.strip()
-        if not line:
-            continue
+        if not line: continue
         m = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s*;\s*(\d+)\s*;\s*([^;]*)\s*;", line)
-        if m:
-            result[m.group(1)] = m.group(3).strip()
+        if m: result[m.group(1)] = m.group(3).strip()
         if line.startswith('BEGIN_STRING;'):
             parts = line.split(';')
-            if len(parts) >= 2:
-                string_keys.append(parts[1].strip())
-
+            if len(parts) >= 2: string_keys.append(parts[1].strip())
     for key in string_keys:
         marker = f"BEGIN_STRING; {key};;"
         idx = text.find(marker)
@@ -72,7 +89,7 @@ def parse_gdml(xml_content, filename):
     try:
         root = ET.fromstring(xml_content)
     except Exception as e:
-        raise ValueError(f"Fehler beim Parsen der XML-Struktur: {e}")
+        raise ValueError(f"Fehler beim Parsen der XML: {e}")
 
     annotations = [el for el in root.iter() if el.tag.split('}')[-1] == 'Annotation']
     comps = [el for el in root.iter() if el.tag.split('}')[-1] == 'InterchangeableComponent']
@@ -82,57 +99,27 @@ def parse_gdml(xml_content, filename):
 
     for ann in annotations:
         name_attr = ann.attrib.get('name')
-        if not name_attr:
-            continue
+        if not name_attr: continue
         text = ann.text or ''
 
-        m = re.match(r"^Tool_(\d+)_Technology$", name_attr)
-        if m:
-            num = m.group(1)
-            tool_data_map.setdefault(num, {})['techText'] = text
-            continue
-
-        m = re.match(r"^Tool_(\d+)_Name$", name_attr)
-        if m:
-            num = m.group(1)
-            tool_data_map.setdefault(num, {})['name'] = text
-            continue
-
-        m = re.match(r"^#cutter(\d+)$", name_attr)
-        if m:
-            num = m.group(1)
-            tool_data_map.setdefault(num, {})['cutterXml'] = text
-            continue
-
-        m = re.match(r"^ToolAssembly_(\d+)_Name$", name_attr)
-        if m:
+        if (m := re.match(r"^Tool_(\d+)_Technology$", name_attr)):
+            tool_data_map.setdefault(m.group(1), {})['techText'] = text
+        elif (m := re.match(r"^Tool_(\d+)_Name$", name_attr)):
+            tool_data_map.setdefault(m.group(1), {})['name'] = text
+        elif (m := re.match(r"^#cutter(\d+)$", name_attr)):
+            tool_data_map.setdefault(m.group(1), {})['cutterXml'] = text
+        elif (m := re.match(r"^ToolAssembly_(\d+)_Name$", name_attr)):
             assembly_map.setdefault(m.group(1), {})['name'] = text
-            continue
-
-        m = re.match(r"^ToolAssembly_(\d+)_KbmDatabaseId$", name_attr)
-        if m:
+        elif (m := re.match(r"^ToolAssembly_(\d+)_KbmDatabaseId$", name_attr)):
             assembly_map.setdefault(m.group(1), {})['kbmId'] = text
-            continue
-
-        m = re.match(r"^ToolAssembly_(\d+)_Reference$", name_attr)
-        if m:
+        elif (m := re.match(r"^ToolAssembly_(\d+)_Reference$", name_attr)):
             assembly_map.setdefault(m.group(1), {})['reference'] = text
-            continue
-
-        m = re.match(r"^ToolAssembly_(\d+)_RootId$", name_attr)
-        if m:
+        elif (m := re.match(r"^ToolAssembly_(\d+)_RootId$", name_attr)):
             assembly_map.setdefault(m.group(1), {})['rootId'] = text
-            continue
-
-        m = re.match(r"^ToolAssembly_(\d+)_RootType$", name_attr)
-        if m:
+        elif (m := re.match(r"^ToolAssembly_(\d+)_RootType$", name_attr)):
             assembly_map.setdefault(m.group(1), {})['rootType'] = text
-            continue
-
-        m = re.match(r"^ToolAssembly_(\d+)_StationID$", name_attr)
-        if m:
+        elif (m := re.match(r"^ToolAssembly_(\d+)_StationID$", name_attr)):
             assembly_map.setdefault(m.group(1), {})['stationId'] = text
-            continue
 
     cutter_to_holder = {}
     for comp in comps:
@@ -142,24 +129,17 @@ def parse_gdml(xml_content, filename):
             target = comp.attrib.get('targetNodeName', '')
             if target:
                 parts = target.split(':')
-                if len(parts) >= 3:
-                    holder_node = parts[2]
-                    if holder_node.isdigit():
-                        cutter_to_holder[cutter_num] = holder_node
+                if len(parts) >= 3 and parts[2].isdigit():
+                    cutter_to_holder[cutter_num] = parts[2]
 
     tools = []
     for num, data in tool_data_map.items():
-        if not data.get('techText') and not data.get('name'):
-            continue
+        if not data.get('techText') and not data.get('name'): continue
 
         tech_data = parse_technology_block(data.get('techText', ''))
         tool_name = data.get('name') or tech_data.get('ToolID') or tech_data.get('Tool_2_Name') or f"Werkzeug {num}"
-
         holder_node = cutter_to_holder.get(num)
-        assembly_name = '—'
-        assembly_root_id = '—'
-        assembly_station_id = '—'
-        assembly_type = '—'
+        assembly_name, assembly_root_id, assembly_station_id, assembly_type = '—', '—', '—', '—'
 
         if holder_node and holder_node in assembly_map:
             ass = assembly_map[holder_node]
@@ -177,20 +157,10 @@ def parse_gdml(xml_content, filename):
                 break
 
         spindle = tech_data.get('SpindleDirection')
-        if spindle == '-1':
-            spindle_str = 'Linkslauf (M4)'
-        elif spindle == '1':
-            spindle_str = 'Rechtslauf (M3)'
-        else:
-            spindle_str = spindle or '—'
+        spindle_str = 'Linkslauf (M4)' if spindle == '-1' else 'Rechtslauf (M3)' if spindle == '1' else spindle or '—'
 
         coolant_val = tech_data.get('NewCoolant') or tech_data.get('Coolant')
-        if coolant_val == '1':
-            coolant_str = 'vorhanden'
-        elif coolant_val == '0':
-            coolant_str = 'nicht vorhanden'
-        else:
-            coolant_str = coolant_val or '—'
+        coolant_str = 'vorhanden' if coolant_val == '1' else 'nicht vorhanden' if coolant_val == '0' else coolant_val or '—'
 
         status_machine = '—'
         if assembly_name:
@@ -200,18 +170,16 @@ def parse_gdml(xml_content, filename):
             elif 'RÜST' in ass_upper:
                 status_machine = 'RÜST'
 
-        # --- Ausspannlänge berechnen (Gesamtlänge - Versatz Z) ---
         raw_length = tech_data.get('OverallLength')
         raw_shift_z = tech_data.get('ToolShiftZ')
+        ausspann_str = '—'
         if raw_length or raw_shift_z:
             try:
                 val_len = float(str(raw_length).replace(',', '.')) if raw_length else 0.0
                 val_z = float(str(raw_shift_z).replace(',', '.')) if raw_shift_z else 0.0
                 ausspann_str = f"{(val_len - val_z):.3f}"
             except ValueError:
-                ausspann_str = '—'
-        else:
-            ausspann_str = '—'
+                pass
 
         tool = {
             'Werkzeugname': tool_name,
@@ -220,7 +188,7 @@ def parse_gdml(xml_content, filename):
             'Durchmesser (mm)': format_number(tech_data.get('ToolDiameter')),
             'Schneidenlänge (mm)': format_number(tech_data.get('CuttingLength')),
             'Gesamtlänge (mm)': format_number(tech_data.get('OverallLength')),
-            'Ausspannlänge (mm)': ausspann_str,  # <--- HIER HINZUGEFÜGT
+            'Ausspannlänge (mm)': ausspann_str,
             'Schaftdurchmesser (mm)': format_number(tech_data.get('ShankDiameter')),
             'Anzahl Schneiden': format_number(tech_data.get('NumberOfFlutes')),
             'Werkzeugtyp': tech_data.get('ToolStyle', '—'),
@@ -264,408 +232,503 @@ def parse_gdml(xml_content, filename):
         }
 
         for k, v in tool.items():
-            if v is None or v == '':
-                tool[k] = '—'
-
+            if v is None or v == '': tool[k] = '—'
         tools.append(tool)
-
     return tools
 
 
-class ToolApp(tk.Tk):
+# ==============================================================================
+#      LABEL MIT AUTOMATISCHER KÜRZUNG (statt fragilem Word-Wrap)
+# ==============================================================================
+class ElidedLabel(QLabel):
+    """
+    QLabel, das lange Texte statt umzubrechen sauber mit '…' kürzt und den
+    vollständigen Text als Tooltip anzeigt. Dadurch bleibt die Zeilenhöhe im
+    QGridLayout immer konstant (ein bekanntes Qt-Problem: setWordWrap(True)
+    in Kombination mit variabler Spaltenbreite berechnet die Zeilenhöhe nicht
+    zuverlässig neu -> Textzeilen können sich überlappen).
+    """
+    def __init__(self, full_text="", parent=None):
+        super().__init__(parent)
+        self._full_text = str(full_text)
+        self.setWordWrap(False)
+        self._apply_elided_text()
+
+    def setFullText(self, text):
+        self._full_text = str(text)
+        self._apply_elided_text()
+
+    def _apply_elided_text(self):
+        fm = self.fontMetrics()
+        available_width = max(self.width(), 40)
+        elided = fm.elidedText(self._full_text, Qt.ElideRight, available_width)
+        super().setText(elided)
+        self.setToolTip(self._full_text if elided != self._full_text else "")
+
+    def resizeEvent(self, event):
+        self._apply_elided_text()
+        super().resizeEvent(event)
+
+
+# ==============================================================================
+#      BILD-WIDGET
+# ==============================================================================
+class ResizableImageLabel(QLabel):
     def __init__(self):
         super().__init__()
-        self.title("ToolService EDGE Werkzeugliste")
-        self.geometry("1400x800")
-        self.minsize(1000, 600)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(250, 250)
+        self._pixmap = None
 
-        self.COLOR_BG = "#f4f7fc"
-        self.COLOR_HEADER = "#0b2b4a"
-        self.COLOR_ACCENT = "#2563eb"
-        self.COLOR_TEXT = "#0f172a"
-        self.COLOR_MUTED = "#64748b"
-        self.COLOR_PANEL = "#ffffff"
+    def set_image(self, pixmap: QPixmap):
+        self._pixmap = pixmap
+        self.update_image()
 
-        self.configure(bg=self.COLOR_BG)
+    def set_placeholder(self, text: str):
+        self._pixmap = None
+        self.setText(text)
+
+    def resizeEvent(self, event):
+        self.update_image()
+        super().resizeEvent(event)
+
+    def update_image(self):
+        if self._pixmap and not self._pixmap.isNull():
+            scaled = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.setPixmap(scaled)
+
+
+# ==============================================================================
+#      HAUPTFENSTER
+# ==============================================================================
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ToolService EDGE Werkzeugliste")
+        self.setMinimumSize(1200, 750)
+
+        app_icon_path = resource_path("assets/logo.png")
+        if os.path.exists(app_icon_path):
+            self.setWindowIcon(QIcon(app_icon_path))
+
+        self._set_application_style()
+        self.setAcceptDrops(True)
 
         self.all_tools = []
         self.filtered_tools = []
-        self.current_tool = None
 
-        # Bild-Referenzen, damit der Garbage Collector sie nicht löscht
-        self.original_image = None
-        self.current_photo = None
-        self.current_tool_name = None
+        self._build_ui()
+        self.load_gdml_file(DEFAULT_FILE_PATH, initial=True)
 
-        self.build_ui()
-        self.load_file_from_path(DEFAULT_FILE_PATH, initial=True)
+    def _set_application_style(self):
+        app = QApplication.instance()
 
-    def build_ui(self):
-        # Header
-        header_frame = tk.Frame(self, bg=self.COLOR_BG, padx=16, pady=8)
-        header_frame.pack(fill=tk.X)
+        fallback_font = "Helvetica" if sys.platform == "darwin" else "Arial"
+        extra = {
+            'accent_color': '#448AFF',
+            'secondaryLightColor': '#31363B',
+            'font_family': fallback_font
+        }
+        apply_stylesheet(app, theme='dark_blue.xml', extra=extra)
 
-        title_lbl = tk.Label(header_frame, text="🔧 ToolService EDGE Werkzeugliste",
-                             font=("Segoe UI", 16, "bold"), fg=self.COLOR_HEADER, bg=self.COLOR_BG)
-        title_lbl.pack(side=tk.LEFT)
+        stylesheet = app.styleSheet()
+        stylesheet = re.sub(r'image:\s*url\(.*?\.svg\);', 'image: none;', stylesheet)
 
-        author_lbl = tk.Label(header_frame, text="by Gschwendtner Johannes",
-                              font=("Segoe UI", 9), fg=self.COLOR_MUTED, bg=self.COLOR_BG)
-        author_lbl.pack(side=tk.RIGHT, pady=(6, 0))
+        custom_css = stylesheet + """
+        QSplitter::handle { background-color: #31363B; image: none; }
+        QSplitter::handle:horizontal { width: 3px; }
+        QSplitter::handle:vertical { height: 3px; }
 
-        # Hauptcontainer
-        main_container = tk.Frame(self, bg=self.COLOR_PANEL, bd=1, relief=tk.SOLID)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
+        QTableWidget {
+            border: 1px solid #31363B;
+            border-radius: 6px;
+            background-color: #1e1e1e;
+            alternate-background-color: #262a30;
+            gridline-color: transparent;
+            outline: 0;
+        }
+        QTableWidget::item { padding: 8px 6px; border: none; }
+        QTableWidget::item:selected { background-color: #448AFF; color: white; border: none; }
+        QHeaderView::section {
+            background-color: #31363B;
+            color: #94a3b8;
+            padding: 6px;
+            border: none;
+            font-weight: bold;
+        }
 
-        paned = ttk.PanedWindow(main_container, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True)
+        QPushButton {
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: rgba(68, 138, 255, 0.15);
+        }
+        QPushButton:pressed {
+            background-color: rgba(68, 138, 255, 0.30);
+        }
 
-        # ----------------- SIDEBAR -----------------
-        sidebar = tk.Frame(paned, bg=self.COLOR_PANEL, width=340)
-        sidebar.pack_propagate(False)
-        paned.add(sidebar, weight=0)
+        QLineEdit {
+            padding: 6px 8px;
+            border: 1px solid #31363B;
+            border-radius: 6px;
+            background-color: #1e1e1e;
+        }
+        QLineEdit:focus {
+            border: 1px solid #448AFF;
+        }
 
-        sb_header = tk.Frame(sidebar, bg=self.COLOR_PANEL, padx=12, pady=12)
-        sb_header.pack(fill=tk.X)
+        #leftCard {
+            background-color: #262a30;
+            border: 1px solid #31363B;
+            border-radius: 8px;
+        }
+        """
+        app.setStyleSheet(custom_css)
 
-        sb_title = tk.Label(sb_header, text="📂 Werkzeuge", font=("Segoe UI", 11, "bold"),
-                            fg=self.COLOR_HEADER, bg=self.COLOR_PANEL)
-        sb_title.pack(anchor=tk.W)
+    def _build_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(15, 5, 15, 10)
+        main_layout.setSpacing(5)
 
-        btn_frame = tk.Frame(sb_header, bg=self.COLOR_PANEL, pady=6)
-        btn_frame.pack(fill=tk.X)
+        # ---------------- HEADER ----------------
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(10)
 
-        open_btn = tk.Button(btn_frame, text="📁 GDML wählen", bg=self.COLOR_ACCENT, fg="white",
-                             font=("Segoe UI", 9, "bold"), relief=tk.FLAT, padx=8, pady=3,
-                             cursor="hand2", command=self.open_file_dialog)
-        open_btn.pack(side=tk.LEFT)
+        title_label = QLabel("🔧 ToolService EDGE Werkzeugliste")
+        title_label.setStyleSheet("font-size: 18pt; font-weight: bold; color: #448AFF;")
+        author_label = QLabel("by Gschwendtner Johannes")
+        author_label.setStyleSheet("color: #64748b; font-size: 9pt;")
+        author_label.setAlignment(Qt.AlignBottom)
 
-        reload_btn = tk.Button(btn_frame, text="🔄 Neu laden", bg="#e2e8f0", fg=self.COLOR_TEXT,
-                               font=("Segoe UI", 8), relief=tk.FLAT, padx=6, pady=3,
-                               cursor="hand2", command=lambda: self.load_file_from_path(DEFAULT_FILE_PATH))
-        reload_btn.pack(side=tk.LEFT, padx=6)
+        header_layout.addWidget(title_label)
+        header_layout.addStretch()
+        header_layout.addWidget(author_label)
+        main_layout.addLayout(header_layout, 0)
 
-        self.status_lbl = tk.Label(sb_header, text="Keine Datei geladen", font=("Segoe UI", 8),
-                                   fg=self.COLOR_MUTED, bg=self.COLOR_PANEL, anchor=tk.W)
-        self.status_lbl.pack(fill=tk.X, pady=(2, 6))
+        # Trennlinie unter dem Header für klare visuelle Struktur
+        header_line = QFrame()
+        header_line.setFrameShape(QFrame.HLine)
+        header_line.setStyleSheet("color: #31363B; background-color: #31363B; max-height: 1px;")
+        main_layout.addWidget(header_line, 0)
+        main_layout.addSpacing(6)
 
-        # Sucheingabe
-        search_frame = tk.Frame(sb_header, bg=self.COLOR_PANEL)
-        search_frame.pack(fill=tk.X)
+        # ---------------- HAUPT-SPLITTER ----------------
+        # WICHTIG: stretch=1, sonst teilt Qt den Platz 50/50 zwischen Header
+        # und Splitter auf (QSplitter hat KEINE "Expanding"-Size-Policy!),
+        # wodurch oben ein riesiger leerer Abstand entsteht.
+        self.splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(self.splitter, 1)
 
-        tk.Label(search_frame, text="🔍", bg=self.COLOR_PANEL, font=("Segoe UI", 10)).pack(side=tk.LEFT)
-        self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", lambda *args: self.filter_tools())
-        search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
-        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        # --- LINKE SEITE (Werkzeugliste) ---
+        # Als "Card" gestaltet: eigener Hintergrund + Rahmen, damit sie sich
+        # klar vom Detailbereich rechts abhebt.
+        left_outer = QWidget()
+        left_outer_layout = QVBoxLayout(left_outer)
+        left_outer_layout.setContentsMargins(0, 0, 15, 0)
 
-        # Werkzeug-Tabelle
-        tree_frame = tk.Frame(sidebar, bg=self.COLOR_PANEL, padx=12)
-        tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
+        left_widget = QFrame()
+        left_widget.setObjectName("leftCard")
+        left_outer_layout.addWidget(left_widget)
 
-        columns = ("Name", "Diameter")
-        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
-        self.tree.heading("Name", text="NAME")
-        self.tree.heading("Diameter", text="⌀")
-        self.tree.column("Name", width=210, anchor=tk.W)
-        self.tree.column("Diameter", width=70, anchor=tk.CENTER)
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(14, 14, 14, 14)
+        left_layout.setSpacing(10)
 
-        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tree_scroll.set)
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
+        btn_open = QPushButton("📁 GDML wählen")
+        btn_open.setCursor(Qt.PointingHandCursor)
+        btn_open.clicked.connect(self._open_file_dialog)
 
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.bind("<<TreeviewSelect>>", self.on_tool_selected)
+        btn_reload = QPushButton("🔄 Neu laden")
+        btn_reload.setCursor(Qt.PointingHandCursor)
+        btn_reload.clicked.connect(lambda: self.load_gdml_file(DEFAULT_FILE_PATH))
 
-        # ----------------- DETAIL VIEW -----------------
-        detail_panel = tk.Frame(paned, bg=self.COLOR_PANEL)
-        paned.add(detail_panel, weight=1)
+        btn_layout.addWidget(btn_open)
+        btn_layout.addWidget(btn_reload)
+        left_layout.addLayout(btn_layout)
 
-        # Empty State
-        self.empty_state_frame = tk.Frame(detail_panel, bg=self.COLOR_PANEL)
-        self.empty_state_frame.pack(fill=tk.BOTH, expand=True)
-        tk.Label(self.empty_state_frame, text="🔧", font=("Segoe UI", 48), bg=self.COLOR_PANEL, fg="#cbd5e1").pack(
-            expand=True, pady=(150, 0))
-        tk.Label(self.empty_state_frame, text="Wähle ein Werkzeug aus der Liste", font=("Segoe UI", 12),
-                 bg=self.COLOR_PANEL, fg=self.COLOR_MUTED).pack(expand=True, pady=(0, 150))
+        self.status_label = QLabel("Keine Datei geladen")
+        self.status_label.setStyleSheet("color: #64748b; font-size: 10pt;")
+        left_layout.addWidget(self.status_label)
 
-        # Detail Content Container
-        self.content_frame = tk.Frame(detail_panel, bg=self.COLOR_PANEL, padx=20, pady=16)
+        search_layout = QHBoxLayout()
+        search_layout.setSpacing(8)
+        search_icon = QLabel("🔍")
+        search_icon.setAlignment(Qt.AlignCenter)
+        search_layout.addWidget(search_icon)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Suchen...")
+        self.search_edit.textChanged.connect(self._filter_tools)
+        search_layout.addWidget(self.search_edit)
+        left_layout.addLayout(search_layout)
 
-        # Detail-Header
-        self.detail_header_frame = tk.Frame(self.content_frame, bg=self.COLOR_PANEL)
-        self.detail_header_frame.pack(fill=tk.X, pady=(0, 10))
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["NAME", "⌀"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        self.table.verticalHeader().setDefaultSectionSize(32)
+        left_layout.addWidget(self.table)
 
-        self.detail_title_lbl = tk.Label(self.detail_header_frame, text="Werkzeug", font=("Segoe UI", 16, "bold"),
-                                         fg=self.COLOR_HEADER, bg=self.COLOR_PANEL, anchor=tk.W)
-        self.detail_title_lbl.pack(fill=tk.X)
+        # Linke Seite: flexible Breite mit sinnvollem Minimum
+        left_outer.setMinimumWidth(320)
+        self.splitter.addWidget(left_outer)
 
-        self.detail_subtitle_lbl = tk.Label(self.detail_header_frame, text="", font=("Segoe UI", 10),
-                                            fg=self.COLOR_MUTED, bg=self.COLOR_PANEL, anchor=tk.W)
-        self.detail_subtitle_lbl.pack(fill=tk.X, pady=(2, 8))
+        # --- RECHTE SEITE (Details) ---
+        self.stacked_widget = QStackedWidget()
+        self.splitter.addWidget(self.stacked_widget)
 
-        sep = tk.Frame(self.detail_header_frame, height=2, bg="#edf2f7")
-        sep.pack(fill=tk.X, pady=(0, 10))
+        # Splitter: Rechte Seite bekommt mehr Platz beim Resizen
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
 
-        # --- PANED WINDOW FÜR TEXT & BILD ---
-        self.detail_split = ttk.PanedWindow(self.content_frame, orient=tk.HORIZONTAL)
-        self.detail_split.pack(fill=tk.BOTH, expand=True)
+        # 1) Leerer Zustand
+        empty_widget = QWidget()
+        empty_layout = QVBoxLayout(empty_widget)
+        empty_icon = QLabel("🔧")
+        empty_icon.setStyleSheet("font-size: 64pt; color: #31363B;")
+        empty_icon.setAlignment(Qt.AlignCenter)
+        empty_text = QLabel("Wähle ein Werkzeug aus der Liste\noder ziehe eine GDML-Datei hierher.")
+        empty_text.setAlignment(Qt.AlignCenter)
+        empty_text.setStyleSheet("color: #64748b; font-size: 12pt;")
+        empty_layout.addStretch()
+        empty_layout.addWidget(empty_icon)
+        empty_layout.addWidget(empty_text)
+        empty_layout.addStretch()
+        self.stacked_widget.addWidget(empty_widget)
 
-        # LINKER BEREICH: TEXT-GRID
-        self.text_container = tk.Frame(self.detail_split, bg=self.COLOR_PANEL)
-        self.detail_split.add(self.text_container, weight=3)
+        # 2) Detailansicht
+        detail_widget = QWidget()
+        detail_layout = QVBoxLayout(detail_widget)
+        detail_layout.setContentsMargins(10, 0, 0, 0)
 
-        self.canvas_text = tk.Canvas(self.text_container, bg=self.COLOR_PANEL, highlightthickness=0)
-        self.detail_scroll = ttk.Scrollbar(self.text_container, orient=tk.VERTICAL, command=self.canvas_text.yview)
-        self.grid_frame = tk.Frame(self.canvas_text, bg=self.COLOR_PANEL)
+        # Detail Header
+        self.detail_title = QLabel("Werkzeug")
+        self.detail_title.setStyleSheet("font-size: 20pt; font-weight: bold; color: white;")
+        self.detail_subtitle = QLabel("⌀ -- mm · --")
+        self.detail_subtitle.setStyleSheet("font-size: 11pt; color: #448AFF; font-weight: bold;")
+        detail_layout.addWidget(self.detail_title)
+        detail_layout.addWidget(self.detail_subtitle)
+        detail_layout.addSpacing(5)
 
-        self.grid_frame.bind("<Configure>",
-                             lambda e: self.canvas_text.configure(scrollregion=self.canvas_text.bbox("all")))
-        self.canvas_text_window = self.canvas_text.create_window((0, 0), window=self.grid_frame, anchor="nw")
-        self.canvas_text.configure(yscrollcommand=self.detail_scroll.set)
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet("color: #31363B;")
+        detail_layout.addWidget(line)
+        detail_layout.addSpacing(10)
 
-        self.canvas_text.bind('<Configure>', self._on_canvas_configure)
-        self.canvas_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.detail_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        # Content Splitter (Links: Text-Raster, Rechts: Bild)
+        # WICHTIG: stretch=1 aus demselben Grund wie beim Haupt-Splitter oben
+        # (sonst konkurriert er mit Titel/Untertitel/Linie um den Platz).
+        self.content_splitter = QSplitter(Qt.Horizontal)
+        detail_layout.addWidget(self.content_splitter, 1)
 
-        # RECHTER BEREICH: BILD
-        self.image_container = tk.Frame(self.detail_split, bg=self.COLOR_PANEL)
-        self.detail_split.add(self.image_container, weight=2)
+        # Text-Raster (Scroll Area)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setMinimumWidth(400)
 
-        tk.Label(self.image_container, text="Werkzeug-Abbildung", font=("Segoe UI", 10, "bold"),
-                 fg=self.COLOR_MUTED, bg=self.COLOR_PANEL, anchor="w").pack(fill=tk.X, padx=10, pady=(0, 5))
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setAlignment(Qt.AlignTop)
+        self.grid_layout.setHorizontalSpacing(15)
+        self.grid_layout.setVerticalSpacing(8)
 
-        self.canvas_image = tk.Canvas(self.image_container, bg="#ffffff", bd=1, relief=tk.SOLID, highlightthickness=0)
-        self.canvas_image.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # Spalten-Verhältnis im Grid definieren
+        self.grid_layout.setColumnStretch(0, 0)
+        self.grid_layout.setColumnStretch(1, 1)
+        self.grid_layout.setColumnStretch(2, 0)
+        self.grid_layout.setColumnStretch(3, 1)
 
-        # Bei Größenänderung des Fensters das Bild skalieren
-        self.canvas_image.bind("<Configure>", self._resize_and_show_image)
+        scroll_area.setWidget(self.grid_container)
+        self.content_splitter.addWidget(scroll_area)
 
-        self.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Bild Area
+        img_container = QWidget()
+        img_layout = QVBoxLayout(img_container)
+        img_layout.setContentsMargins(15, 0, 0, 0)
 
-    def _on_canvas_configure(self, event):
-        self.canvas_text.itemconfig(self.canvas_text_window, width=event.width)
+        img_title = QLabel("Werkzeug-Abbildung")
+        img_title.setStyleSheet("font-weight: bold; color: #64748b; font-size: 11pt;")
 
-    def _on_mousewheel(self, event):
-        widget = self.winfo_containing(event.x_root, event.y_root)
-        if not widget:
-            return
+        self.image_label = ResizableImageLabel()
+        self.image_label.setStyleSheet("border: 2px dashed #31363B; border-radius: 8px; background-color: #1e1e1e;")
+        self.image_label.setMinimumWidth(300)
 
-        delta = int(-1 * (event.delta / 120)) if event.delta else 0
-        if delta == 0:
-            return
+        img_layout.addWidget(img_title)
+        img_layout.addWidget(self.image_label, 1)
+        self.content_splitter.addWidget(img_container)
 
-        w = widget
-        while w is not None:
-            if w == self.canvas_text or w == self.grid_frame:
-                if self.content_frame.winfo_ismapped():
-                    self.canvas_text.yview_scroll(delta, "units")
-                return
-            # Das rechte Bild-Canvas darf das Scroll-Event nicht stören
-            if w == self.canvas_image:
-                return
-            w = getattr(w, "master", None)
+        # Content Splitter: Text bekommt mehr Gewicht, Bild bleibt flexibel
+        self.content_splitter.setStretchFactor(0, 1)
+        self.content_splitter.setStretchFactor(1, 0)
 
-    def load_file_from_path(self, path, initial=False):
+        self.stacked_widget.addWidget(detail_widget)
+
+        # Initiale Splitter-Größen (verhältnismäßiger)
+        self.splitter.setSizes([350, 850])
+        self.content_splitter.setSizes([550, 350])
+
+    # ----------------- DRAG & DROP -----------------
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls() and event.mimeData().urls()[0].isLocalFile():
+            path = event.mimeData().urls()[0].toLocalFile()
+            if path.lower().endswith('.gdml') or path.lower().endswith('.xml'):
+                event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent):
+        path = event.mimeData().urls()[0].toLocalFile()
+        self.load_gdml_file(path)
+
+    # ----------------- LOGIK -----------------
+    def _open_file_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "GDML-Datei auswählen", BASE_DIR, "GDML / XML Dateien (*.gdml *.xml);;Alle Dateien (*.*)"
+        )
+        if path:
+            self.load_gdml_file(path)
+
+    def load_gdml_file(self, path, initial=False):
         if not os.path.exists(path):
             if initial:
-                self.status_lbl.config(text=f"Datei nicht gefunden: {os.path.basename(path)}")
+                self.status_label.setText(f"Datei nicht gefunden:\n{os.path.basename(path)}")
             else:
-                messagebox.showerror("Datei nicht gefunden", f"Konnte die Datei nicht finden:\n{path}")
+                QMessageBox.critical(self, "Fehler", f"Konnte die Datei nicht finden:\n{path}")
             return
 
         try:
-            with open(path, "r", encoding="iso-8859-1") as f:
-                content = f.read()
+            # FIX: Zuerst als UTF-8 versuchen, dann Fallback auf ISO
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                with open(path, "r", encoding="iso-8859-1") as f:
+                    content = f.read()
 
             filename = os.path.basename(path)
             tools = parse_gdml(content, filename)
 
             if not tools:
-                messagebox.showwarning("Keine Daten", f"Keine Werkzeuge in {filename} gefunden.")
+                QMessageBox.warning(self, "Keine Daten", f"Keine Werkzeuge in {filename} gefunden.")
                 return
 
             self.all_tools = tools
-            self.status_lbl.config(text=f"{len(tools)} Werkzeuge geladen ({filename})")
-            self.search_var.set("")
-            self.filter_tools()
-
-            if self.tree.get_children():
-                first_item = self.tree.get_children()[0]
-                self.tree.selection_set(first_item)
-                self.tree.focus(first_item)
+            self.status_label.setText(f"{len(tools)} Werkzeuge geladen")
+            self.search_edit.clear()
+            self._filter_tools()
 
         except Exception as e:
-            messagebox.showerror("Fehler beim Laden", f"Fehler beim Lesen der GDML-Datei:\n{e}")
+            QMessageBox.critical(self, "Ladefehler", f"Fehler beim Lesen der GDML-Datei:\n{e}")
 
-    def open_file_dialog(self):
-        filename = filedialog.askopenfilename(
-            title="GDML-Datei auswählen",
-            filetypes=[("GDML / XML Dateien", "*.gdml *.xml"), ("Alle Dateien", "*.*")]
-        )
-        if filename:
-            self.load_file_from_path(filename)
-
-    def filter_tools(self):
-        query = self.search_var.get().strip()
+    def _filter_tools(self):
+        query = self.search_edit.text().strip()
         if not query:
             self.filtered_tools = self.all_tools[:]
         else:
             tokens = query.split()
             filtered = []
-
             for tool in self.all_tools:
-                searchable_values = [
-                    tool.get('Werkzeugname', ''),
-                    tool.get('Durchmesser (mm)', ''),
-                    tool.get('Werkzeug-ID', ''),
-                    tool.get('Werkzeugnummer', ''),
-                    tool.get('Werkzeugtyp', ''),
-                    tool.get('Kommentar', ''),
-                    tool.get('Aufnahme', '')
-                ]
+                searchable = " ".join([
+                    tool.get('Werkzeugname', ''), tool.get('Durchmesser (mm)', ''),
+                    tool.get('Werkzeug-ID', ''), tool.get('Werkzeugnummer', ''),
+                    tool.get('Werkzeugtyp', ''), tool.get('Kommentar', ''), tool.get('Aufnahme', '')
+                ])
+                raw_comb = normalize_str(searchable)
+                clean_comb = clean_str(searchable)
 
-                raw_combined = normalize_str(" ".join(searchable_values))
-                clean_combined = clean_str(" ".join(searchable_values))
-
-                matches_all_tokens = True
+                match_all = True
                 for token in tokens:
-                    token_norm = normalize_str(token)
-                    token_clean = clean_str(token)
-
-                    in_raw = token_norm in raw_combined
-                    in_clean = (len(token_clean) > 0 and token_clean in clean_combined)
-
-                    if not (in_raw or in_clean):
-                        matches_all_tokens = False
+                    tn = normalize_str(token)
+                    tc = clean_str(token)
+                    if not (tn in raw_comb or (len(tc) > 0 and tc in clean_comb)):
+                        match_all = False
                         break
-
-                if matches_all_tokens:
+                if match_all:
                     filtered.append(tool)
 
             self.filtered_tools = filtered
 
-        self.tree.delete(*self.tree.get_children())
+        self.table.setRowCount(0)
         for idx, tool in enumerate(self.filtered_tools):
-            name = tool.get('Werkzeugname', '—')
-            diam = tool.get('Durchmesser (mm)', '—')
-            self.tree.insert("", tk.END, iid=str(idx), values=(name, diam))
+            self.table.insertRow(idx)
+            self.table.setItem(idx, 0, QTableWidgetItem(tool.get('Werkzeugname', '—')))
+            item_diam = QTableWidgetItem(tool.get('Durchmesser (mm)', '—'))
+            item_diam.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(idx, 1, item_diam)
 
         if not self.filtered_tools:
-            self.show_empty_state()
+            self.stacked_widget.setCurrentIndex(0)
         else:
-            first_item = self.tree.get_children()[0]
-            self.tree.selection_set(first_item)
-            self.tree.focus(first_item)
+            self.table.selectRow(0)
 
-    def on_tool_selected(self, event):
-        selected_items = self.tree.selection()
-        if not selected_items:
+    def _on_table_selection_changed(self):
+        selected = self.table.selectedItems()
+        if not selected:
+            self.stacked_widget.setCurrentIndex(0)
             return
-        idx = int(selected_items[0])
-        if 0 <= idx < len(self.filtered_tools):
-            self.current_tool = self.filtered_tools[idx]
-            self.render_tool_detail(self.current_tool)
+        row = selected[0].row()
+        if 0 <= row < len(self.filtered_tools):
+            self._render_tool_detail(self.filtered_tools[row])
 
-    def show_empty_state(self):
-        self.content_frame.pack_forget()
-        self.empty_state_frame.pack(fill=tk.BOTH, expand=True)
-
-    # ----------------- BILD-LOGIK -----------------
-    def load_and_display_image(self, tool_name):
-        self.original_image = None
-        self.current_photo = None
-        self.current_tool_name = tool_name
-        self.canvas_image.delete("all")
-
+    def _load_image(self, tool_name):
         if not tool_name or tool_name == '—':
-            self._draw_placeholder("Kein Werkzeugname\ndefiniert.")
+            self.image_label.set_placeholder("Kein Werkzeugname\ndefiniert.")
             return
 
-        # Mögliche Dateiendungen durchprobieren
-        extensions = [".png", ".jpg", ".jpeg", ".bmp", ".PNG", ".JPG", ".JPEG", ".BMP"]
-        img_path = None
-
-        # Zuerst exakter Name, dann zur Sicherheit einen "gesäuberten" probieren
+        extensions = [".png", ".jpg", ".jpeg", ".bmp"]
         safe_name = tool_name.replace("/", "_").replace("\\", "_")
 
-        for ext in extensions:
-            path = os.path.join(IMAGE_DIR, f"{tool_name}{ext}")
-            if os.path.exists(path):
-                img_path = path
-                break
+        img_path = None
+        for name in [tool_name, safe_name]:
+            for ext in extensions:
+                path = os.path.join(IMAGE_DIR, f"{name}{ext}")
+                if os.path.exists(path):
+                    img_path = path
+                    break
+                path_up = os.path.join(IMAGE_DIR, f"{name}{ext.upper()}")
+                if os.path.exists(path_up):
+                    img_path = path_up
+                    break
+            if img_path: break
 
-            path_safe = os.path.join(IMAGE_DIR, f"{safe_name}{ext}")
-            if os.path.exists(path_safe):
-                img_path = path_safe
-                break
+        if img_path:
+            pixmap = QPixmap(img_path)
+            if not pixmap.isNull():
+                self.image_label.set_image(pixmap)
+            else:
+                self.image_label.set_placeholder("Fehler beim Laden\ndes Bildes.")
+        else:
+            self.image_label.set_placeholder(
+                f"Kein Bild gefunden für:\n'{tool_name}'\n\nErwarteter Ordner:\n{IMAGE_DIR}")
 
-        if not img_path:
-            self._draw_placeholder(f"Kein Bild gefunden im Ordner\nBilder-WZ für:\n\n'{tool_name}'")
-            return
-
-        try:
-            self.original_image = Image.open(img_path)
-            self._resize_and_show_image()
-        except Exception as e:
-            self._draw_placeholder(f"Fehler beim Laden:\n{e}")
-
-    def _draw_placeholder(self, text):
-        self.canvas_image.delete("all")
-        w = self.canvas_image.winfo_width()
-        h = self.canvas_image.winfo_height()
-        if w < 10 or h < 10:
-            w, h = 300, 300
-
-        self.canvas_image.create_text(w / 2, h / 2, text=text, justify=tk.CENTER,
-                                      fill=self.COLOR_MUTED, font=("Segoe UI", 10))
-
-    def _resize_and_show_image(self, event=None):
-        if not self.original_image:
-            if self.current_tool_name:
-                self.load_and_display_image(self.current_tool_name)
-            return
-
-        w = self.canvas_image.winfo_width()
-        h = self.canvas_image.winfo_height()
-
-        if w < 10 or h < 10:
-            return
-
-        img_w, img_h = self.original_image.size
-
-        ratio = min((w * 0.95) / img_w, (h * 0.95) / img_h)
-        new_w = int(img_w * ratio)
-        new_h = int(img_h * ratio)
-
-        if new_w <= 0 or new_h <= 0:
-            return
-
-        resized_img = self.original_image.resize((new_w, new_h), Image.LANCZOS)
-
-        self.current_photo = ImageTk.PhotoImage(resized_img)
-        self.canvas_image.delete("all")
-        self.canvas_image.create_image(w / 2, h / 2, image=self.current_photo, anchor=tk.CENTER)
-
-    # ----------------- TOOL DETAIL ANSICHT -----------------
-    def render_tool_detail(self, tool):
-        self.empty_state_frame.pack_forget()
-        self.content_frame.pack(fill=tk.BOTH, expand=True)
+    def _render_tool_detail(self, tool):
+        self.stacked_widget.setCurrentIndex(1)
 
         tool_name = tool.get('Werkzeugname', 'Unbenanntes Werkzeug')
-        self.detail_title_lbl.config(text=tool_name)
+        self.detail_title.setText(tool_name)
         d = tool.get('Durchmesser (mm)', '—')
         typ = tool.get('Werkzeugtyp', '—')
-        self.detail_subtitle_lbl.config(text=f"⌀ {d} mm · {typ}")
+        self.detail_subtitle.setText(f"⌀ {d} mm  |  {typ}")
 
-        # --- BILD LADEN ---
-        self.load_and_display_image(tool_name)
+        self._load_image(tool_name)
 
-        # --- TEXTTABELLE ---
-        for widget in self.grid_frame.winfo_children():
-            widget.destroy()
+        # Grid leeren
+        for i in reversed(range(self.grid_layout.count())):
+            widget = self.grid_layout.itemAt(i).widget()
+            if widget: widget.setParent(None)
 
-        # HIER WURDE 'Ausspannlänge (mm)' HINZUGEFÜGT
         categories = {
             'Basisdaten': ['Werkzeugnummer', 'Werkzeug-ID', 'Werkzeugname', 'Werkzeugtyp', 'Einheit', 'Kommentar'],
             'Geometrie': ['Durchmesser (mm)', 'Schneidenlänge (mm)', 'Gesamtlänge (mm)', 'Ausspannlänge (mm)',
@@ -674,65 +737,71 @@ class ToolApp(tk.Tk):
             'Aufnahme & Halter': ['Aufnahme', 'Aufnahmegröße', 'Baugruppe', 'Baugruppentyp', 'Root-ID', 'Station-ID'],
             'Maschinenparameter': ['Längenkorrekturregister', 'Spindeldrehrichtung', 'Werkzeugausrichtung',
                                    'Schutzebene (mm)'],
-            'Versatz & Offset': ['Versatz X (mm)', 'Versatz Y (mm)', 'Versatz Z (mm)', 'Offset X (mm)',
-                                 'Offset Y (mm)', 'Offset Z (mm)'],
+            'Versatz & Offset': ['Versatz X (mm)', 'Versatz Y (mm)', 'Versatz Z (mm)', 'Offset X (mm)', 'Offset Y (mm)',
+                                 'Offset Z (mm)'],
             'Rotation & Vektor': ['Rotation X (°)', 'Rotation Y (°)', 'Rotation Z (°)', 'Vektor X', 'Vektor Y',
                                   'Vektor Z'],
             'Kühlung & Material': ['Kühlung', 'Kühlungsdruck', 'Kühlungsdruck-Wert', 'Beschichtung'],
             'Status & Sonstiges': ['Status Maschine', 'Simulationsfarbe', 'Standard-Kontrollpunkt', 'Dateiname']
         }
 
-        self.grid_frame.columnconfigure(0, weight=0, minsize=140)
-        self.grid_frame.columnconfigure(1, weight=1)
-        self.grid_frame.columnconfigure(2, weight=0, minsize=140)
-        self.grid_frame.columnconfigure(3, weight=1)
-
         row = 0
         for cat_name, fields in categories.items():
             valid_fields = [f for f in fields if f in tool]
-            if not valid_fields:
-                continue
+            if not valid_fields: continue
 
-            title_lbl = tk.Label(self.grid_frame, text=cat_name, font=("Segoe UI", 10, "bold"),
-                                 fg="#1e293b", bg=self.COLOR_PANEL, anchor="w", pady=4)
-            title_lbl.grid(row=row, column=0, columnspan=4, sticky="we", pady=(12, 4))
+            if row > 0:
+                spacer = QFrame()
+                spacer.setFixedHeight(8)
+                self.grid_layout.addWidget(spacer, row, 0, 1, 4)
+                row += 1
+
+            cat_label = QLabel(cat_name.upper())
+            cat_label.setStyleSheet("font-weight: bold; color: #448AFF; font-size: 10pt; letter-spacing: 1px;")
+            self.grid_layout.addWidget(cat_label, row, 0, 1, 4)
             row += 1
 
-            title_sep = tk.Frame(self.grid_frame, height=1, bg="#e2e8f0")
-            title_sep.grid(row=row, column=0, columnspan=4, sticky="we", pady=(0, 6))
+            line = QFrame()
+            line.setFrameShape(QFrame.HLine)
+            line.setStyleSheet("color: #31363B;")
+            self.grid_layout.addWidget(line, row, 0, 1, 4)
             row += 1
 
             for i in range(0, len(valid_fields), 2):
                 f1 = valid_fields[i]
                 v1 = tool.get(f1, '—')
 
-                lbl1 = tk.Label(self.grid_frame, text=f1.upper(), font=("Segoe UI", 8, "bold"),
-                                fg=self.COLOR_MUTED, bg=self.COLOR_PANEL, anchor="w")
-                lbl1.grid(row=row, column=0, sticky="nw", padx=(4, 8), pady=2)
+                l1 = QLabel(f1)
+                l1.setStyleSheet("color: #94a3b8; font-size: 9pt;")
+                val1 = ElidedLabel(v1)
+                if v1 != '—':
+                    val1.setStyleSheet("font-weight: bold; color: white; font-size: 10pt;")
+                else:
+                    val1.setStyleSheet("color: #475569; font-size: 10pt;")
 
-                val1_fg = self.COLOR_TEXT if v1 != '—' else "#94a3b8"
-                val1 = tk.Label(self.grid_frame, text=v1, font=("Segoe UI", 9, "bold" if v1 != '—' else "normal"),
-                                fg=val1_fg, bg=self.COLOR_PANEL, anchor="w", wraplength=220, justify=tk.LEFT)
-                val1.grid(row=row, column=1, sticky="w", padx=(0, 16), pady=2)
+                self.grid_layout.addWidget(l1, row, 0, alignment=Qt.AlignTop | Qt.AlignLeft)
+                self.grid_layout.addWidget(val1, row, 1, alignment=Qt.AlignTop | Qt.AlignLeft)
 
                 if i + 1 < len(valid_fields):
                     f2 = valid_fields[i + 1]
                     v2 = tool.get(f2, '—')
 
-                    lbl2 = tk.Label(self.grid_frame, text=f2.upper(), font=("Segoe UI", 8, "bold"),
-                                    fg=self.COLOR_MUTED, bg=self.COLOR_PANEL, anchor="w")
-                    lbl2.grid(row=row, column=2, sticky="nw", padx=(4, 8), pady=2)
+                    l2 = QLabel(f2)
+                    l2.setStyleSheet("color: #94a3b8; font-size: 9pt;")
+                    val2 = ElidedLabel(v2)
+                    if v2 != '—':
+                        val2.setStyleSheet("font-weight: bold; color: white; font-size: 10pt;")
+                    else:
+                        val2.setStyleSheet("color: #475569; font-size: 10pt;")
 
-                    val2_fg = self.COLOR_TEXT if v2 != '—' else "#94a3b8"
-                    val2 = tk.Label(self.grid_frame, text=v2, font=("Segoe UI", 9, "bold" if v2 != '—' else "normal"),
-                                    fg=val2_fg, bg=self.COLOR_PANEL, anchor="w", wraplength=220, justify=tk.LEFT)
-                    val2.grid(row=row, column=3, sticky="w", pady=2)
+                    self.grid_layout.addWidget(l2, row, 2, alignment=Qt.AlignTop | Qt.AlignLeft)
+                    self.grid_layout.addWidget(val2, row, 3, alignment=Qt.AlignTop | Qt.AlignLeft)
 
                 row += 1
 
-        self.canvas_text.yview_moveto(0)
-
 
 if __name__ == "__main__":
-    app = ToolApp()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
