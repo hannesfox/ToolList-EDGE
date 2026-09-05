@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Document>
+    <!-- ========================================== -->
+    <!-- WERKZEUG 1: Basis-Name                     -->
+    <!-- ========================================== -->
+    <Annotation name="Tool_1_Name">FR-D10X60</Annotation>
+
+    <!-- ========================================== -->
+    <!-- WERKZEUG 1: Technologie & Parameter        -->
+    <!-- (Formatiert als: Variable ; Typ ; Wert ;)  -->
+    <!-- ========================================== -->
+    <Annotation name="Tool_1_Technology">
+ToolNumber ; 1 ; 1 ;
+ToolID ; 3 ; FR-D10X60 ;
+ToolDiameter ; 2 ; 10.000000 ;
+CuttingLength ; 2 ; 14.000000 ;
+OverallLength ; 2 ; 100.000000 ;
+ShankDiameter ; 2 ; 9.200000 ;
+ShankTopDiameter ; 2 ; 10.000000 ;
+ShankBottomLength ; 2 ; 60.000000 ;
+ShankAngle ; 2 ; 90.000000 ;
+NumberOfFlutes ; 1 ; 4 ;
+ToolStyle ; 3 ; Schaftfräser ;
+ShankType ; 3 ; Konisch ;
+LengthCompRegister ; 1 ; 1 ;
+SpindleDirection ; 1 ; 1 ;
+Coolant ; 1 ; 0 ;
+ToolMaterial ; 3 ; VHM Fräser Lang (RockTec 52) ;
+HolderDiameter ; 2 ; 40.000000 ;
+ToolShiftX ; 2 ; 0.000000 ;
+ToolShiftY ; 2 ; 0.000000 ;
+ToolShiftZ ; 2 ; 35.000000 ;
+SimulationColor ; 3 ; Blau ;
+Orientation ; 3 ; Vertikal ;
+ToolUnit ; 3 ; Metrisch ;
+InitialClearance ; 2 ; 50.000000 ;
+BEGIN_STRING; Comment;;
+: STD: (FIX-RÜST)
+    </Annotation>
+
+    <!-- ========================================== -->
+    <!-- BAUGRUPPE / HALTER                         -->
+    <!-- ========================================== -->
+    <!-- Die ID '42' verknüpft die Baugruppe mit dem Halter -->
+    <Annotation name="ToolAssembly_42_Name">HSK63-Aufnahme FIX-RÜST</Annotation>
+    <Annotation name="ToolAssembly_42_StationID">1</Annotation>
+    <Annotation name="ToolAssembly_42_RootType">Spindel</Annotation>
+
+    <!-- ========================================== -->
+    <!-- VERKNÜPFUNGEN (InterchangeableComponent)   -->
+    <!-- ========================================== -->
+    <!-- 1. Sagt dem System, dass 'cutter1' in den Knoten '42' gehört -->
+    <InterchangeableComponent componentFile="#cutter1" targetNodeName="machine:spindle:42" />
+
+    <!-- 2. Definiert die Aufnahme-Datei, die ebenfalls auf Knoten '42' liegt -->
+    <InterchangeableComponent componentFile="Halter_Standard_HSK63.gdml" newNodeName="42" />
+</Document>
