@@ -1,0 +1,156 @@
+# .github/workflows/main.yml
+
+name: Build and Release ToolService EDGE
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install PyInstaller and Application Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install --no-cache-dir pyinstaller==6.8.0
+        pip install --no-cache-dir Pillow
+        # Falls du eine requirements.txt hast, wird sie hier mitinstalliert:
+        if [ -f "requirements.txt" ]; then pip install --no-cache-dir -r requirements.txt; fi
+      shell: bash
+      timeout-minutes: 10
+
+    # Generiere Windows .ico
+    - name: Generate Windows Icon (ICO)
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        $ICON_SOURCE_PNG="assets/logo.png"
+        if (Test-Path $ICON_SOURCE_PNG) {
+          echo "Installing ImageMagick via Chocolatey..."
+          choco install imagemagick --force --no-progress
+          magick "$ICON_SOURCE_PNG" -resize 256x256 scaled_icon_source.png
+          magick convert scaled_icon_source.png -define icon:autoresize=256,128,64,48,32,16 icon.ico
+          echo "DEBUG: icon.ico created for Windows."
+          Remove-Item scaled_icon_source.png -ErrorAction SilentlyContinue
+        } else {
+          echo "WARNING: assets/logo.png not found. Skipping icon generation."
+        }
+
+    # Generiere macOS .icns
+    - name: Generate macOS Icon (ICNS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        ICON_SOURCE_PNG="assets/logo.png"
+        if [ -f "$ICON_SOURCE_PNG" ]; then
+          mkdir icon.iconset
+          sips -z 512 512 "$ICON_SOURCE_PNG" --out scaled_icon_source.png
+          
+          sips -z 16 16 scaled_icon_source.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32 scaled_icon_source.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32 scaled_icon_source.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64 scaled_icon_source.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128 scaled_icon_source.png --out icon.iconset/icon_64x64.png
+          sips -z 256 256 scaled_icon_source.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256 scaled_icon_source.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512 scaled_icon_source.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 1024 1024 scaled_icon_source.png --out icon.iconset/icon_512x512@2x.png
+          
+          iconutil -c icns icon.iconset -o icon.icns
+          echo "DEBUG: icon.icns created for macOS."
+          rm -r icon.iconset
+          rm scaled_icon_source.png 2>/dev/null || true
+        else
+          echo "WARNING: assets/logo.png not found. Skipping icon generation."
+        fi
+
+    - name: Extract version from tag
+      id: get_version
+      if: startsWith(github.ref, 'refs/tags/')
+      run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: Build Application with PyInstaller
+      timeout-minutes: 20
+      run: |
+        APP_VERSION=${{ steps.get_version.outputs.VERSION || 'dev' }}
+        echo "Building version $APP_VERSION"
+        
+        args=(
+          --noconfirm
+          main.py
+          --name "ToolService-EDGE"
+          --clean
+          --hidden-import "PIL._tkinter_finder"
+        )
+
+        # Icon hinzufügen, falls es generiert wurde
+        if [ "$RUNNER_OS" == "Windows" ] && [ -f "icon.ico" ]; then
+          args+=(--icon "icon.ico")
+        elif [ "$RUNNER_OS" == "macOS" ] && [ -f "icon.icns" ]; then
+          args+=(--icon "icon.icns")
+        fi
+
+        # --windowed Mode unterdrückt das CMD/Konsolenfenster im Hintergrund
+        args+=(--windowed)
+
+        pyinstaller "${args[@]}"
+      shell: bash
+
+    - name: Prepare Windows Release Artifact
+      if: runner.os == 'Windows'
+      id: prepare_win
+      shell: powershell
+      run: |
+        $APP_VERSION = "${{ steps.get_version.outputs.VERSION || 'dev' }}"
+        $SOURCE_PATH = "dist/ToolService-EDGE" 
+        $ARTIFACT_NAME = "ToolService-EDGE-v$($APP_VERSION)-windows.zip"
+        Compress-Archive -Path $SOURCE_PATH -DestinationPath $ARTIFACT_NAME -Force
+        echo "ARTIFACT_NAME=$ARTIFACT_NAME" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+    - name: Prepare macOS Release Artifact
+      if: runner.os == 'macOS'
+      id: prepare_mac
+      shell: bash
+      run: |
+        APP_VERSION="${{ steps.get_version.outputs.VERSION || 'dev' }}"
+        ARTIFACT_NAME="ToolService-EDGE-v${APP_VERSION}-macos.zip"
+        if [ ! -d "dist/ToolService-EDGE.app" ]; then
+          echo "Error: dist/ToolService-EDGE.app not found. PyInstaller build failed."
+          exit 1
+        fi
+        ditto -c -k --sequesterRsrc --keepParent "dist/ToolService-EDGE.app" "${ARTIFACT_NAME}"
+        echo "ARTIFACT_NAME=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ToolService-EDGE-Build-${{ matrix.os }}
+        path: ${{ steps.prepare_win.outputs.ARTIFACT_NAME || steps.prepare_mac.outputs.ARTIFACT_NAME }}
+        if-no-files-found: error
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ToolService-EDGE-v${{ steps.get_version.outputs.VERSION }}-windows.zip
+          ToolService-EDGE-v${{ steps.get_version.outputs.VERSION }}-macos.zip
