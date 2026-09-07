@@ -238,20 +238,23 @@ def parse_gdml(xml_content, filename):
 
 
 # ==============================================================================
-#      LABEL MIT AUTOMATISCHER KÜRZUNG (statt fragilem Word-Wrap)
+#      LABEL MIT AUTOMATISCHER KÜRZUNG ODER UMBRUCH
 # ==============================================================================
 class ElidedLabel(QLabel):
     """
-    QLabel, das lange Texte statt umzubrechen sauber mit '…' kürzt und den
-    vollständigen Text als Tooltip anzeigt. Dadurch bleibt die Zeilenhöhe im
-    QGridLayout immer konstant (ein bekanntes Qt-Problem: setWordWrap(True)
-    in Kombination mit variabler Spaltenbreite berechnet die Zeilenhöhe nicht
-    zuverlässig neu -> Textzeilen können sich überlappen).
+    QLabel, das lange Texte intelligent behandelt:
+    - Kurze Texte: Einzeilig
+    - Mittlere Texte: Werden mit '…' gekürzt (Tooltip zeigt Volltext)
+    - Sehr lange Texte (z.B. Pfade): Automatisch zweizeilig mit Word-Wrap
+
+    Verhindert Layout-Probleme bei variablen Spaltenbreiten.
     """
-    def __init__(self, full_text="", parent=None):
+
+    def __init__(self, full_text="", max_chars_for_elision=45, parent=None):
         super().__init__(parent)
         self._full_text = str(full_text)
-        self.setWordWrap(False)
+        self._max_chars_for_elision = max_chars_for_elision
+        self.setWordWrap(False)  # Standardmäßig kein Wrap
         self._apply_elided_text()
 
     def setFullText(self, text):
@@ -261,9 +264,18 @@ class ElidedLabel(QLabel):
     def _apply_elided_text(self):
         fm = self.fontMetrics()
         available_width = max(self.width(), 40)
-        elided = fm.elidedText(self._full_text, Qt.ElideRight, available_width)
-        super().setText(elided)
-        self.setToolTip(self._full_text if elided != self._full_text else "")
+
+        # Wenn Text sehr lang ist -> Zweizeilig machen statt elidieren
+        if len(self._full_text) > self._max_chars_for_elision:
+            self.setWordWrap(True)
+            super().setText(self._full_text)
+            self.setToolTip(self._full_text)
+        else:
+            # Normaler Fall: Elidieren wenn nötig
+            self.setWordWrap(False)
+            elided = fm.elidedText(self._full_text, Qt.ElideRight, available_width)
+            super().setText(elided)
+            self.setToolTip(self._full_text if elided != self._full_text else "")
 
     def resizeEvent(self, event):
         self._apply_elided_text()
@@ -305,7 +317,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ToolService EDGE Werkzeugliste")
-        self.setMinimumSize(1200, 750)
+        self.setMinimumSize(1850, 1200)
 
         app_icon_path = resource_path("assets/logo.png")
         if os.path.exists(app_icon_path):
@@ -619,6 +631,7 @@ class MainWindow(QMainWindow):
 
             filename = os.path.basename(path)
             tools = parse_gdml(content, filename)
+            tools.sort(key=lambda t: t.get('Werkzeugname', '').lower())
 
             if not tools:
                 QMessageBox.warning(self, "Keine Daten", f"Keine Werkzeuge in {filename} gefunden.")
