@@ -1,6 +1,8 @@
 import sys
 import os
 import re
+import math
+import logging
 import xml.etree.ElementTree as ET
 
 # 1. WICHTIG: PyQt5 muss registriert werden, BEVOR qt_material importiert wird!
@@ -9,15 +11,22 @@ import PyQt5
 from PyQt5 import QtCore, QtGui, QtWidgets, QtSvg
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QStackedWidget,
-    QFrame, QSizePolicy
+    QScrollArea, QStackedWidget, QFrame, QSizePolicy, QGraphicsDropShadowEffect,
+    QToolButton, QSpacerItem
 )
-from PyQt5.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent
-from PyQt5.QtCore import Qt
+from PyQt5.QtGui import (
+    QIcon, QPixmap, QDragEnterEvent, QDropEvent, QPainter, QColor, QPen,
+    QFont, QLinearGradient, QPainterPath, QFontDatabase
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPoint, QEvent
 
+# qt_material-Warnings ("must be imported after...", "QFontDatabase") unterdrücken
+_log_level_backup = logging.root.level
+logging.root.setLevel(logging.ERROR)
 from qt_material import apply_stylesheet
+logging.root.setLevel(_log_level_backup)
 
 
 # ==============================================================================
@@ -43,6 +52,22 @@ def resource_path(relative_path: str) -> str:
 
 
 # ==============================================================================
+#      FARBPALETTE: BLAUES BASIS-DESIGN + ORANGE AKZENTE
+# ==============================================================================
+BLUE          = "#448AFF"
+BLUE_BRIGHT   = "#82B1FF"
+ORANGE        = "#FF7A1A"
+ORANGE_BRIGHT = "#FFA050"
+BG_BASE       = "#0f1419"
+BG_PANEL      = "#1e2433"
+BG_PANEL_2    = "#141b24"
+BORDER        = "#2d3748"
+TEXT_MAIN     = "#e2e8f0"
+TEXT_SEC      = "#64748b"
+TEXT_MUTED    = "#475569"
+
+
+# ==============================================================================
 #      GDML PARSER
 # ==============================================================================
 def format_number(val):
@@ -59,6 +84,20 @@ def normalize_str(s):
 
 def clean_str(s):
     return re.sub(r'[^a-z0-9äöüß]', '', str(s).lower())
+
+
+def _try_float(s):
+    if s is None:
+        return None
+    try:
+        return float(str(s).replace(',', '.'))
+    except (ValueError, TypeError):
+        return None
+
+
+def natural_sort_key(s):
+    """Natürliche Sortierung: FR-D05 kommt vor FR-D040."""
+    return [int(p) if p.isdigit() else p.lower() for p in re.split(r'(\d+)', str(s))]
 
 
 def parse_technology_block(text):
@@ -122,8 +161,12 @@ def parse_gdml(xml_content, filename):
             assembly_map.setdefault(m.group(1), {})['stationId'] = text
 
     cutter_to_holder = {}
+    node_file_map = {}   # PERFORMANCE: newNodeName -> componentFile nur EINMAL durchlaufen
     for comp in comps:
         file_attr = comp.attrib.get('componentFile', '')
+        new_node = comp.attrib.get('newNodeName', '')
+        if new_node:
+            node_file_map[new_node] = file_attr
         if file_attr.startswith('#cutter'):
             cutter_num = file_attr.replace('#cutter', '')
             target = comp.attrib.get('targetNodeName', '')
@@ -149,12 +192,9 @@ def parse_gdml(xml_content, filename):
             assembly_type = ass.get('rootType', '—')
 
         holder_path = '—'
-        for comp in comps:
-            if comp.attrib.get('newNodeName') == holder_node:
-                cf = comp.attrib.get('componentFile', '')
-                if cf and not cf.startswith('#'):
-                    holder_path = cf
-                break
+        cf = node_file_map.get(holder_node, '')
+        if cf and not cf.startswith('#'):
+            holder_path = cf
 
         spindle = tech_data.get('SpindleDirection')
         spindle_str = 'Linkslauf (M4)' if spindle == '-1' else 'Rechtslauf (M3)' if spindle == '1' else spindle or '—'
@@ -238,87 +278,265 @@ def parse_gdml(xml_content, filename):
 
 
 # ==============================================================================
-#      LABEL MIT AUTOMATISCHER KÜRZUNG ODER UMBRUCH
+#      RELEVANZ-SCORING FÜR DIE SUCHE
 # ==============================================================================
-class ElidedLabel(QLabel):
-    """
-    QLabel, das lange Texte intelligent behandelt:
-    - Kurze Texte: Einzeilig
-    - Mittlere Texte: Werden mit '…' gekürzt (Tooltip zeigt Volltext)
-    - Sehr lange Texte (z.B. Pfade): Automatisch zweizeilig mit Word-Wrap
+def _token_score(tool, token):
+    tn = normalize_str(token)
+    tc = clean_str(token)
+    if not tn:
+        return 0
+    tnum = _try_float(tn)
 
-    Verhindert Layout-Probleme bei variablen Spaltenbreiten.
-    """
+    score = 0
+    matched = False
 
-    def __init__(self, full_text="", max_chars_for_elision=45, parent=None):
-        super().__init__(parent)
-        self._full_text = str(full_text)
-        self._max_chars_for_elision = max_chars_for_elision
-        self.setWordWrap(False)  # Standardmäßig kein Wrap
-        self._apply_elided_text()
+    raw_name = tool.get('Werkzeugname', '') or ''
+    name = normalize_str(raw_name)
+    name_clean = clean_str(raw_name)
 
-    def setFullText(self, text):
-        self._full_text = str(text)
-        self._apply_elided_text()
-
-    def _apply_elided_text(self):
-        fm = self.fontMetrics()
-        available_width = max(self.width(), 40)
-
-        # Wenn Text sehr lang ist -> Zweizeilig machen statt elidieren
-        if len(self._full_text) > self._max_chars_for_elision:
-            self.setWordWrap(True)
-            super().setText(self._full_text)
-            self.setToolTip(self._full_text)
+    # ---------- 1) NAME (höchste Priorität) ----------
+    if tn in name or (tc and tc in name_clean):
+        matched = True
+        if name == tn:
+            score += 10000
+        elif name.startswith(tn):
+            score += 5000
+        elif re.search(r'[^a-z0-9äöüß]' + re.escape(tn), name):
+            score += 3000
         else:
-            # Normaler Fall: Elidieren wenn nötig
-            self.setWordWrap(False)
-            elided = fm.elidedText(self._full_text, Qt.ElideRight, available_width)
-            super().setText(elided)
-            self.setToolTip(self._full_text if elided != self._full_text else "")
+            score += 2000
 
-    def resizeEvent(self, event):
-        self._apply_elided_text()
-        super().resizeEvent(event)
+        if tnum is not None and tnum.is_integer():
+            m = re.search(r'(\d+)$', name_clean)
+            if m and int(m.group(1)) == int(tnum):
+                score += 2500
+
+    # ---------- 2) NUMERISCHE FELDER ----------
+    if tnum is not None:
+        diam_raw = tool.get('Durchmesser (mm)', '')
+        diam = _try_float(diam_raw)
+        if diam is not None:
+            if abs(diam - tnum) < 1e-9:
+                score += 4000
+                matched = True
+            elif normalize_str(diam_raw).startswith(tn):
+                score += 1200
+                matched = True
+
+        num = _try_float(tool.get('Werkzeugnummer', ''))
+        if num is not None and abs(num - tnum) < 1e-9:
+            score += 3500
+            matched = True
+
+    # ---------- 3) WEITERE FELDER ----------
+    for field, pts in (('Werkzeug-ID', 600),
+                       ('Werkzeugtyp', 500),
+                       ('Kommentar', 200),
+                       ('Aufnahme', 100)):
+        val = normalize_str(tool.get(field, ''))
+        if val and tn in val:
+            score += pts
+            matched = True
+
+    return score if matched else 0
 
 
 # ==============================================================================
-#      BILD-WIDGET
+#      GLOW-HELPER
 # ==============================================================================
-class ResizableImageLabel(QLabel):
-    def __init__(self):
-        super().__init__()
-        self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(250, 250)
+def add_glow(widget, color=QColor(255, 122, 26), blur=30, alpha=90):
+    eff = QGraphicsDropShadowEffect(widget)
+    c = QColor(color)
+    c.setAlpha(alpha)
+    eff.setColor(c)
+    eff.setBlurRadius(blur)
+    eff.setOffset(0, 0)
+    widget.setGraphicsEffect(eff)
+    return eff
+
+
+# ==============================================================================
+#      PLATZHALTER-ICON (Detailseite, kein Text)
+# ==============================================================================
+class PlaceholderIconWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(200, 200)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+        w = self.width()
+        h = self.height()
+        size = min(w, h) * 0.5
+        cx = w / 2
+        cy = h / 2
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(40, 50, 65, 180))
+        painter.drawEllipse(QPoint(int(cx), int(cy)), int(size * 0.55), int(size * 0.55))
+
+        pen = QPen(QColor(255, 138, 66, 210))
+        pen.setWidth(max(3, int(size * 0.04)))
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+
+        shaft_w = size * 0.12
+        shaft_h = size * 0.3
+        shaft_x = cx - shaft_w / 2
+        shaft_y = cy - size * 0.35
+        painter.drawRect(int(shaft_x), int(shaft_y), int(shaft_w), int(shaft_h))
+
+        cut_w = size * 0.2
+        cut_h = size * 0.25
+        cut_x = cx - cut_w / 2
+        cut_y = cy - size * 0.05
+        painter.drawRect(int(cut_x), int(cut_y), int(cut_w), int(cut_h))
+
+        pen2 = QPen(QColor(255, 138, 66, 140))
+        pen2.setWidth(max(2, int(size * 0.025)))
+        painter.setPen(pen2)
+        for i in range(3):
+            y_off = cut_y + cut_h * (0.2 + i * 0.3)
+            painter.drawLine(int(cut_x + 2), int(y_off), int(cut_x + cut_w - 2), int(y_off + cut_h * 0.1))
+
+        pen3 = QPen(QColor(255, 138, 66, 210))
+        pen3.setWidth(max(3, int(size * 0.04)))
+        painter.setPen(pen3)
+        tip_y = cut_y + cut_h
+        painter.drawLine(int(cx), int(tip_y), int(cx), int(tip_y + size * 0.08))
+
+        painter.end()
+
+
+# ==============================================================================
+#      BILD-WIDGET (Detailseite)
+# ==============================================================================
+class ResizableImageLabel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self._pixmap = None
+        self._show_placeholder = True
+        self._placeholder_widget = None
+        self._image_label = None
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+
+        self._placeholder_widget = PlaceholderIconWidget()
+        self._image_label = QLabel()
+        self._image_label.setAlignment(Qt.AlignCenter)
+        self._image_label.setScaledContents(False)
+
+        self._layout.addWidget(self._placeholder_widget)
+        self._layout.addWidget(self._image_label)
+        self._image_label.hide()
 
     def set_image(self, pixmap: QPixmap):
         self._pixmap = pixmap
-        self.update_image()
+        self._show_placeholder = False
+        self._placeholder_widget.hide()
+        self._image_label.show()
+        self._update_image()
 
-    def set_placeholder(self, text: str):
+    def set_placeholder(self):
         self._pixmap = None
-        self.setText(text)
+        self._show_placeholder = True
+        self._image_label.hide()
+        self._placeholder_widget.show()
 
     def resizeEvent(self, event):
-        self.update_image()
+        self._update_image()
         super().resizeEvent(event)
 
-    def update_image(self):
-        if self._pixmap and not self._pixmap.isNull():
-            scaled = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.setPixmap(scaled)
+    def _update_image(self):
+        if self._pixmap and not self._pixmap.isNull() and not self._show_placeholder:
+            available = self._image_label.size()
+            if available.width() > 0 and available.height() > 0:
+                scaled = self._pixmap.scaled(
+                    available, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+                self._image_label.setPixmap(scaled)
+
+
+# ==============================================================================
+#      WERKZEUG-KACHEL (Tile) – orange Umrandung, Name + ⌀ + Ausspannlänge
+# ==============================================================================
+class ToolTileWidget(QFrame):
+    clicked = pyqtSignal(dict)
+
+    def __init__(self, tool_data, parent=None):
+        super().__init__(parent)
+        self.tool_data = tool_data
+        self.setObjectName("toolTile")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(150)
+        self.setMinimumWidth(220)
+
+        self._full_name = self.tool_data.get('Werkzeugname', 'Unbenannt')
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(6)
+
+        # Name (fett, wird bei Platzmangel gekürzt)
+        self._name_label = QLabel(self._full_name)
+        self._name_label.setObjectName("tileName")
+        self._name_label.setToolTip(self._full_name)
+        layout.addWidget(self._name_label)
+
+        # Durchmesser
+        diam = self.tool_data.get('Durchmesser (mm)', '—')
+        diam_text = f"⌀ {diam} mm" if diam and diam != '—' else "⌀ —"
+        diam_label = QLabel(diam_text)
+        diam_label.setObjectName("tileDiam")
+        layout.addWidget(diam_label)
+
+        # Ausspannlänge
+        aus = self.tool_data.get('Ausspannlänge (mm)', '—')
+        aus_text = f"Ausspannlänge: {aus} mm" if aus and aus != '—' else "Ausspannlänge: —"
+        aus_label = QLabel(aus_text)
+        aus_label.setObjectName("tileAus")
+        layout.addWidget(aus_label)
+
+        layout.addStretch(1)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Namen sauber kürzen ("…") statt abschneiden
+        fm = self._name_label.fontMetrics()
+        available = max(self.width() - 40, 60)
+        self._name_label.setText(fm.elidedText(self._full_name, Qt.ElideRight, available))
+
+    def mouseReleaseEvent(self, event):
+        if self.rect().contains(event.pos()):
+            self.clicked.emit(self.tool_data)
+        super().mouseReleaseEvent(event)
 
 
 # ==============================================================================
 #      HAUPTFENSTER
 # ==============================================================================
 class MainWindow(QMainWindow):
+    RESULT_BATCH = 60
+    TILE_MIN_WIDTH = 250    # Mindestbreite einer Kachel -> bestimmt Spaltenanzahl
+    TILE_MAX_COLS = 6
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ToolService EDGE Werkzeugliste")
-        self.setMinimumSize(1850, 1200)
+        self.setMinimumSize(1200, 800)
+        self.resize(1600, 1000)
 
+        # Icon nur setzen wenn eine echte Logo-Datei existiert
         app_icon_path = resource_path("assets/logo.png")
         if os.path.exists(app_icon_path):
             self.setWindowIcon(QIcon(app_icon_path))
@@ -328,283 +546,710 @@ class MainWindow(QMainWindow):
 
         self.all_tools = []
         self.filtered_tools = []
+        self._current_results = []
+        self._tile_widgets = []
+        self._shown_count = 0
+        self._pending_query = ""
+        self._grid_cols = 0
+
+        # ---------- Glow-Puls (Timer-basiert, kompatibel mit allen PyQt5-Versionen) ----------
+        self._glow_targets = []   # [effect, lo, hi, speed, phase]
+        self._glow_t = 0.0
+        self._glow_timer = QTimer(self)
+        self._glow_timer.setInterval(40)
+        self._glow_timer.timeout.connect(self._tick_glow)
+
+        # ---------- Such-Debounce ----------
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(180)
+        self._search_timer.timeout.connect(self._run_pending_search)
+
+        # ---------- Relayout-Debounce fürs Kachel-Grid ----------
+        self._relayout_timer = QTimer(self)
+        self._relayout_timer.setSingleShot(True)
+        self._relayout_timer.setInterval(120)
+        self._relayout_timer.timeout.connect(self._arrange_tiles)
 
         self._build_ui()
+
+        # Resize des Scroll-Viewports beobachten -> Grid neu anordnen
+        self.results_scroll.viewport().installEventFilter(self)
+
         self.load_gdml_file(DEFAULT_FILE_PATH, initial=True)
 
+    # ------------------------------------------------------------------
+    #  GLOW-PULS (sinusbasiert)
+    # ------------------------------------------------------------------
+    def _pulse_glow(self, effect, lo=22, hi=45, speed=0.002):
+        phase = len(self._glow_targets) * 1.3
+        self._glow_targets.append([effect, lo, hi, speed, phase])
+        if not self._glow_timer.isActive():
+            self._glow_timer.start()
+
+    def _tick_glow(self):
+        self._glow_t += 40.0
+        dead = []
+        for i, (eff, lo, hi, speed, phase) in enumerate(self._glow_targets):
+            v = lo + (hi - lo) * (0.5 + 0.5 * math.sin(self._glow_t * speed + phase))
+            try:
+                eff.setBlurRadius(int(v))
+            except RuntimeError:
+                dead.append(i)
+        for i in reversed(dead):
+            self._glow_targets.pop(i)
+        if not self._glow_targets:
+            self._glow_timer.stop()
+
+    # ------------------------------------------------------------------
+    def eventFilter(self, obj, event):
+        if obj is self.results_scroll.viewport() and event.type() == QEvent.Resize:
+            self._relayout_timer.start()
+        return super().eventFilter(obj, event)
+
+    # ------------------------------------------------------------------
     def _set_application_style(self):
         app = QApplication.instance()
 
-        fallback_font = "Helvetica" if sys.platform == "darwin" else "Arial"
+        fallback_font = "Helvetica" if sys.platform == "darwin" else "Segoe UI"
         extra = {
-            'accent_color': '#448AFF',
-            'secondaryLightColor': '#31363B',
+            'accent_color': BLUE,
+            'secondaryLightColor': BG_PANEL,
             'font_family': fallback_font
         }
+
+        # qt_material-Warnings unterdrücken
+        prev_level = logging.root.level
+        logging.root.setLevel(logging.ERROR)
         apply_stylesheet(app, theme='dark_blue.xml', extra=extra)
+        logging.root.setLevel(prev_level)
 
         stylesheet = app.styleSheet()
         stylesheet = re.sub(r'image:\s*url\(.*?\.svg\);', 'image: none;', stylesheet)
 
-        custom_css = stylesheet + """
-        QSplitter::handle { background-color: #31363B; image: none; }
-        QSplitter::handle:horizontal { width: 3px; }
-        QSplitter::handle:vertical { height: 3px; }
+        custom_css = stylesheet + f"""
+        * {{
+            font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+        }}
 
-        QTableWidget {
-            border: 1px solid #31363B;
-            border-radius: 6px;
-            background-color: #1e1e1e;
-            alternate-background-color: #262a30;
-            gridline-color: transparent;
-            outline: 0;
-        }
-        QTableWidget::item { padding: 8px 6px; border: none; }
-        QTableWidget::item:selected { background-color: #448AFF; color: white; border: none; }
-        QHeaderView::section {
-            background-color: #31363B;
-            color: #94a3b8;
-            padding: 6px;
+        QMainWindow {{
+            background-color: {BG_BASE};
+        }}
+
+        QScrollArea {{
             border: none;
+            background: transparent;
+        }}
+
+        QScrollBar:vertical {{
+            background-color: {BG_BASE};
+            width: 8px;
+            border-radius: 4px;
+            margin: 0;
+        }}
+        QScrollBar::handle:vertical {{
+            background-color: {BORDER};
+            border-radius: 4px;
+            min-height: 40px;
+        }}
+        QScrollBar::handle:vertical:hover {{
+            background-color: {ORANGE};
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+            height: 0px;
+        }}
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+            background: none;
+        }}
+
+        QPushButton {{
+            padding: 14px 24px;
+            border-radius: 12px;
             font-weight: bold;
-        }
+            font-size: 13pt;
+            border: none;
+        }}
+        QPushButton:hover {{
+            background-color: rgba(68, 138, 255, 0.18);
+        }}
+        QPushButton:pressed {{
+            background-color: rgba(68, 138, 255, 0.32);
+        }}
 
-        QPushButton {
-            padding: 8px 14px;
-            border-radius: 6px;
+        QLineEdit {{
+            padding: 16px 20px;
+            border: 2px solid {BORDER};
+            border-radius: 16px;
+            background-color: #1a2332;
+            font-size: 16pt;
+            color: {TEXT_MAIN};
+            selection-background-color: {BLUE};
+        }}
+        QLineEdit:focus {{
+            border: 2px solid {BLUE};
+            background-color: #1e2a3a;
+        }}
+        QLineEdit::placeholder {{
+            color: {TEXT_MUTED};
+        }}
+
+        QLabel {{
+            color: {TEXT_MAIN};
+        }}
+
+        /* ---------- Werkzeug-Kacheln: ORANGE Umrandung ---------- */
+        ToolTileWidget {{
+            background-color: {BG_PANEL};
+            border: 2px solid rgba(255, 122, 26, 0.50);
+            border-radius: 14px;
+        }}
+        ToolTileWidget:hover {{
+            background-color: #253045;
+            border: 2px solid {ORANGE};
+        }}
+        ToolTileWidget:pressed {{
+            background-color: #2a3a55;
+            border: 2px solid {ORANGE_BRIGHT};
+        }}
+        QLabel#tileName {{
+            font-size: 14pt;
             font-weight: bold;
-        }
-        QPushButton:hover {
-            background-color: rgba(68, 138, 255, 0.15);
-        }
-        QPushButton:pressed {
-            background-color: rgba(68, 138, 255, 0.30);
-        }
-
-        QLineEdit {
-            padding: 6px 8px;
-            border: 1px solid #31363B;
-            border-radius: 6px;
-            background-color: #1e1e1e;
-        }
-        QLineEdit:focus {
-            border: 1px solid #448AFF;
-        }
-
-        #leftCard {
-            background-color: #262a30;
-            border: 1px solid #31363B;
-            border-radius: 8px;
-        }
+            color: {TEXT_MAIN};
+            background: transparent;
+            border: none;
+        }}
+        QLabel#tileDiam {{
+            font-size: 12pt;
+            font-weight: bold;
+            color: {BLUE_BRIGHT};
+            background: transparent;
+            border: none;
+        }}
+        QLabel#tileAus {{
+            font-size: 11pt;
+            color: {TEXT_SEC};
+            background: transparent;
+            border: none;
+        }}
+        QLabel#resultsFooter {{
+            color: {TEXT_SEC};
+            font-size: 12pt;
+            padding: 14px;
+            background: transparent;
+        }}
         """
         app.setStyleSheet(custom_css)
 
+    # ------------------------------------------------------------------
     def _build_ui(self):
         central_widget = QWidget()
+        central_widget.setStyleSheet(f"background-color: {BG_BASE};")
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(15, 5, 15, 10)
-        main_layout.setSpacing(5)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        # ---------------- HEADER ----------------
-        header_layout = QHBoxLayout()
-        header_layout.setSpacing(10)
+        self.page_stack = QStackedWidget()
+        main_layout.addWidget(self.page_stack)
 
-        title_label = QLabel("🔧 ToolService EDGE Werkzeugliste")
-        title_label.setStyleSheet("font-size: 18pt; font-weight: bold; color: #448AFF;")
-        author_label = QLabel("by Gschwendtner Johannes")
-        author_label.setStyleSheet("color: #64748b; font-size: 9pt;")
-        author_label.setAlignment(Qt.AlignBottom)
+        self._build_home_page()
+        self._build_detail_page()
 
-        header_layout.addWidget(title_label)
-        header_layout.addStretch()
-        header_layout.addWidget(author_label)
-        main_layout.addLayout(header_layout, 0)
+    # ------------------------------------------------------------------
+    #  STARTSEITE
+    # ------------------------------------------------------------------
+    def _build_home_page(self):
+        home_page = QWidget()
+        home_page.setStyleSheet(f"background-color: {BG_BASE};")
+        home_layout = QVBoxLayout(home_page)
+        home_layout.setContentsMargins(0, 0, 0, 0)
+        home_layout.setSpacing(0)
 
-        # Trennlinie unter dem Header für klare visuelle Struktur
-        header_line = QFrame()
-        header_line.setFrameShape(QFrame.HLine)
-        header_line.setStyleSheet("color: #31363B; background-color: #31363B; max-height: 1px;")
-        main_layout.addWidget(header_line, 0)
-        main_layout.addSpacing(6)
+        top_container = QWidget()
+        top_container.setStyleSheet(f"background-color: {BG_BASE};")
+        top_layout = QVBoxLayout(top_container)
+        top_layout.setContentsMargins(40, 24, 40, 16)
+        top_layout.setSpacing(0)
 
-        # ---------------- HAUPT-SPLITTER ----------------
-        # WICHTIG: stretch=1, sonst teilt Qt den Platz 50/50 zwischen Header
-        # und Splitter auf (QSplitter hat KEINE "Expanding"-Size-Policy!),
-        # wodurch oben ein riesiger leerer Abstand entsteht.
-        self.splitter = QSplitter(Qt.Horizontal)
-        main_layout.addWidget(self.splitter, 1)
+        # ---------- Header Zeile 1: Titel (OHNE Symbol) + Button ----------
+        header_row = QHBoxLayout()
+        header_row.setSpacing(12)
 
-        # --- LINKE SEITE (Werkzeugliste) ---
-        # Als "Card" gestaltet: eigener Hintergrund + Rahmen, damit sie sich
-        # klar vom Detailbereich rechts abhebt.
-        left_outer = QWidget()
-        left_outer_layout = QVBoxLayout(left_outer)
-        left_outer_layout.setContentsMargins(0, 0, 15, 0)
+        title_label = QLabel("ToolService EDGE Werkzeugliste")
+        title_label.setStyleSheet(
+            f"font-size: 18pt; font-weight: bold; color: {BLUE}; background: transparent;"
+        )
+        header_row.addWidget(title_label)
+        header_row.addStretch()
 
-        left_widget = QFrame()
-        left_widget.setObjectName("leftCard")
-        left_outer_layout.addWidget(left_widget)
-
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(14, 14, 14, 14)
-        left_layout.setSpacing(10)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(8)
-        btn_open = QPushButton("📁 GDML wählen")
+        btn_open = QPushButton("📁 Datei öffnen")
+        btn_open.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {BG_PANEL};
+                color: {TEXT_SEC};
+                padding: 10px 18px;
+                border-radius: 10px;
+                font-size: 12pt;
+                border: 1px solid {BORDER};
+            }}
+            QPushButton:hover {{
+                background-color: #253045;
+                color: {TEXT_MAIN};
+                border: 1px solid {BLUE};
+            }}
+        """)
         btn_open.setCursor(Qt.PointingHandCursor)
         btn_open.clicked.connect(self._open_file_dialog)
+        header_row.addWidget(btn_open)
 
-        btn_reload = QPushButton("🔄 Neu laden")
-        btn_reload.setCursor(Qt.PointingHandCursor)
-        btn_reload.clicked.connect(lambda: self.load_gdml_file(DEFAULT_FILE_PATH))
+        top_layout.addLayout(header_row)
 
-        btn_layout.addWidget(btn_open)
-        btn_layout.addWidget(btn_reload)
-        left_layout.addLayout(btn_layout)
+        # ---------- Header Zeile 2: Autor klein, rechts UNTER dem Button ----------
+        author_row = QHBoxLayout()
+        author_row.addStretch()
+        author_label = QLabel("by Gschwendtner Johannes")
+        author_label.setStyleSheet(
+            f"font-size: 10pt; color: {TEXT_MUTED}; background: transparent;"
+        )
+        author_row.addWidget(author_label)
+        top_layout.addLayout(author_row)
 
-        self.status_label = QLabel("Keine Datei geladen")
-        self.status_label.setStyleSheet("color: #64748b; font-size: 10pt;")
-        left_layout.addWidget(self.status_label)
+        top_layout.addSpacing(14)
 
-        search_layout = QHBoxLayout()
-        search_layout.setSpacing(8)
-        search_icon = QLabel("🔍")
-        search_icon.setAlignment(Qt.AlignCenter)
-        search_layout.addWidget(search_icon)
+        # ---------- Zentrierte Such-Sektion ----------
+        search_center = QWidget()
+        search_center.setStyleSheet("background: transparent;")
+        search_center_layout = QVBoxLayout(search_center)
+        search_center_layout.setAlignment(Qt.AlignCenter)
+        search_center_layout.setSpacing(12)
+
+        headline = QLabel("Werkzeuge durchsuchen")
+        headline.setStyleSheet(
+            "font-size: 31pt; font-weight: bold; color: #f5f7fa; background: transparent;"
+        )
+        headline.setAlignment(Qt.AlignCenter)
+        # Oranger Glut-Glow + Puls (Akzent)
+        self._pulse_glow(add_glow(headline, QColor(255, 122, 26), blur=35, alpha=110))
+        search_center_layout.addWidget(headline)
+
+        self.subtitle_label = QLabel("Tippe um zu suchen – Ergebnisse erscheinen sofort")
+        self.subtitle_label.setStyleSheet(
+            f"font-size: 13pt; color: {TEXT_SEC}; background: transparent;"
+        )
+        self.subtitle_label.setAlignment(Qt.AlignCenter)
+        search_center_layout.addWidget(self.subtitle_label)
+
+        search_center_layout.addSpacing(20)
+
+        search_wrapper = QWidget()
+        search_wrapper.setStyleSheet("background: transparent;")
+        search_wrapper_layout = QHBoxLayout(search_wrapper)
+        search_wrapper_layout.setContentsMargins(0, 0, 0, 0)
+
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Suchen...")
-        self.search_edit.textChanged.connect(self._filter_tools)
-        search_layout.addWidget(self.search_edit)
-        left_layout.addLayout(search_layout)
+        self.search_edit.setPlaceholderText("🔍  Werkzeugname, Durchmesser, ID, Typ...")
+        self.search_edit.setMinimumHeight(68)
+        self.search_edit.textChanged.connect(self._on_search_changed)
+        add_glow(self.search_edit, QColor(68, 138, 255), blur=24, alpha=45)
+        search_wrapper_layout.addWidget(self.search_edit)
 
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["NAME", "⌀"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        self.table.setShowGrid(False)
-        self.table.verticalHeader().setVisible(False)
-        self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
-        self.table.verticalHeader().setDefaultSectionSize(32)
-        left_layout.addWidget(self.table)
+        search_center_layout.addWidget(search_wrapper)
 
-        # Linke Seite: flexible Breite mit sinnvollem Minimum
-        left_outer.setMinimumWidth(320)
-        self.splitter.addWidget(left_outer)
+        search_center.setMaximumWidth(900)
 
-        # --- RECHTE SEITE (Details) ---
-        self.stacked_widget = QStackedWidget()
-        self.splitter.addWidget(self.stacked_widget)
+        top_layout.addWidget(search_center, 0, Qt.AlignHCenter)
 
-        # Splitter: Rechte Seite bekommt mehr Platz beim Resizen
-        self.splitter.setStretchFactor(0, 0)
-        self.splitter.setStretchFactor(1, 1)
+        home_layout.addWidget(top_container, 0)
 
-        # 1) Leerer Zustand
-        empty_widget = QWidget()
-        empty_layout = QVBoxLayout(empty_widget)
-        empty_icon = QLabel("🔧")
-        empty_icon.setStyleSheet("font-size: 64pt; color: #31363B;")
-        empty_icon.setAlignment(Qt.AlignCenter)
-        empty_text = QLabel("Wähle ein Werkzeug aus der Liste\noder ziehe eine GDML-Datei hierher.")
-        empty_text.setAlignment(Qt.AlignCenter)
-        empty_text.setStyleSheet("color: #64748b; font-size: 12pt;")
-        empty_layout.addStretch()
-        empty_layout.addWidget(empty_icon)
-        empty_layout.addWidget(empty_text)
-        empty_layout.addStretch()
-        self.stacked_widget.addWidget(empty_widget)
+        # ---------- Glühende Trennlinie (Oranger Akzent) ----------
+        separator = QFrame()
+        separator.setFixedHeight(2)
+        separator.setStyleSheet(
+            "background: qlineargradient(x0:0, y0:0, x1:1, y1:0, "
+            "stop:0 rgba(255,122,26,0), stop:0.5 rgba(255,122,26,170), "
+            "stop:1 rgba(255,122,26,0)); border: none;"
+        )
+        self._pulse_glow(add_glow(separator, QColor(255, 122, 26), blur=18, alpha=120),
+                         lo=10, hi=26, speed=0.0015)
+        home_layout.addWidget(separator, 0)
 
-        # 2) Detailansicht
-        detail_widget = QWidget()
-        detail_layout = QVBoxLayout(detail_widget)
-        detail_layout.setContentsMargins(10, 0, 0, 0)
+        # ---------- Ergebnisbereich (Kachel-Grid) ----------
+        results_container = QWidget()
+        results_container.setStyleSheet(f"background-color: {BG_BASE};")
+        results_layout = QVBoxLayout(results_container)
+        results_layout.setContentsMargins(20, 10, 20, 10)
+        results_layout.setSpacing(0)
 
-        # Detail Header
+        self.results_info = QLabel("")
+        self.results_info.setStyleSheet(
+            f"font-size: 12pt; color: {TEXT_SEC}; padding: 8px 12px; background: transparent;"
+        )
+        results_layout.addWidget(self.results_info, 0)
+
+        self.results_scroll = QScrollArea()
+        self.results_scroll.setWidgetResizable(True)
+        self.results_scroll.setStyleSheet("background: transparent; border: none;")
+
+        # Body: Kachel-Grid + Footer
+        self.results_body = QWidget()
+        self.results_body.setStyleSheet("background: transparent;")
+        body_layout = QVBoxLayout(self.results_body)
+        body_layout.setContentsMargins(8, 8, 8, 8)
+        body_layout.setSpacing(8)
+
+        self.tiles_widget = QWidget()
+        self.tiles_widget.setStyleSheet("background: transparent;")
+        self.tiles_grid = QGridLayout(self.tiles_widget)
+        self.tiles_grid.setSpacing(14)
+        self.tiles_grid.setContentsMargins(4, 4, 4, 4)
+        body_layout.addWidget(self.tiles_widget)
+
+        self.results_footer = QLabel("")
+        self.results_footer.setObjectName("resultsFooter")
+        self.results_footer.setAlignment(Qt.AlignCenter)
+        body_layout.addWidget(self.results_footer)
+
+        body_layout.addStretch(1)
+
+        self.results_scroll.setWidget(self.results_body)
+        results_layout.addWidget(self.results_scroll, 1)
+
+        self.results_scroll.verticalScrollBar().valueChanged.connect(self._on_results_scrolled)
+
+        home_layout.addWidget(results_container, 1)
+
+        self.page_stack.addWidget(home_page)
+
+    # ------------------------------------------------------------------
+    #  DETAILSEITE
+    # ------------------------------------------------------------------
+    def _build_detail_page(self):
+        detail_page = QWidget()
+        detail_page.setStyleSheet(f"background-color: {BG_BASE};")
+        detail_main_layout = QVBoxLayout(detail_page)
+        detail_main_layout.setContentsMargins(0, 0, 0, 0)
+        detail_main_layout.setSpacing(0)
+
+        # ---------- Top-Bar: Zurück-Button + Autor rechts darunter ----------
+        back_bar = QFrame()
+        back_bar.setStyleSheet(f"""
+            QFrame {{
+                background-color: {BG_PANEL_2};
+                border-bottom: 1px solid {BORDER};
+            }}
+        """)
+        back_bar_layout = QVBoxLayout(back_bar)
+        back_bar_layout.setContentsMargins(20, 12, 20, 8)
+        back_bar_layout.setSpacing(4)
+
+        row1 = QHBoxLayout()
+        self.btn_back = QPushButton()
+        self.btn_back.setText("←   Zurück zur Übersicht")
+        self.btn_back.setMinimumHeight(64)
+        self.btn_back.setMinimumWidth(360)
+        self.btn_back.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.btn_back.setCursor(Qt.PointingHandCursor)
+        self.btn_back.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {BG_PANEL};
+                color: {BLUE_BRIGHT};
+                border: 2px solid {BORDER};
+                border-radius: 14px;
+                font-size: 15pt;
+                font-weight: bold;
+                padding: 18px 34px;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background-color: #253045;
+                border: 2px solid {BLUE};
+            }}
+            QPushButton:pressed {{
+                background-color: #2a3a55;
+                border: 2px solid {ORANGE};
+            }}
+        """)
+        add_glow(self.btn_back, QColor(255, 122, 26), blur=26, alpha=70)  # oranger Glut-Schein
+        self.btn_back.clicked.connect(self._go_back)
+        row1.addWidget(self.btn_back)
+        row1.addStretch()
+        back_bar_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addStretch()
+        author_label = QLabel("by Gschwendtner Johannes")
+        author_label.setStyleSheet(
+            f"font-size: 10pt; color: {TEXT_MUTED}; background: transparent;"
+        )
+        row2.addWidget(author_label)
+        back_bar_layout.addLayout(row2)
+
+        detail_main_layout.addWidget(back_bar, 0)
+
+        # ---------- Detail-Content ----------
+        detail_content = QWidget()
+        detail_content.setStyleSheet("background: transparent;")
+        content_layout = QHBoxLayout(detail_content)
+        content_layout.setContentsMargins(30, 20, 30, 20)
+        content_layout.setSpacing(30)
+
+        left_side = QWidget()
+        left_side.setStyleSheet("background: transparent;")
+        left_layout = QVBoxLayout(left_side)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+
         self.detail_title = QLabel("Werkzeug")
-        self.detail_title.setStyleSheet("font-size: 20pt; font-weight: bold; color: white;")
-        self.detail_subtitle = QLabel("⌀ -- mm · --")
-        self.detail_subtitle.setStyleSheet("font-size: 11pt; color: #448AFF; font-weight: bold;")
-        detail_layout.addWidget(self.detail_title)
-        detail_layout.addWidget(self.detail_subtitle)
-        detail_layout.addSpacing(5)
+        self.detail_title.setStyleSheet(
+            "font-size: 27pt; font-weight: bold; color: #f5f7fa; background: transparent;"
+        )
+        self.detail_title.setWordWrap(True)
+        add_glow(self.detail_title, QColor(68, 138, 255), blur=28, alpha=60)
+        left_layout.addWidget(self.detail_title)
 
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color: #31363B;")
-        detail_layout.addWidget(line)
-        detail_layout.addSpacing(10)
+        self.detail_subtitle = QLabel("")
+        self.detail_subtitle.setStyleSheet(f"""
+            QLabel {{
+                font-size: 14pt;
+                color: {BLUE};
+                font-weight: bold;
+                background: transparent;
+                padding: 4px 0;
+            }}
+        """)
+        left_layout.addWidget(self.detail_subtitle)
 
-        # Content Splitter (Links: Text-Raster, Rechts: Bild)
-        # WICHTIG: stretch=1 aus demselben Grund wie beim Haupt-Splitter oben
-        # (sonst konkurriert er mit Titel/Untertitel/Linie um den Platz).
-        self.content_splitter = QSplitter(Qt.Horizontal)
-        detail_layout.addWidget(self.content_splitter, 1)
+        left_layout.addSpacing(8)
 
-        # Text-Raster (Scroll Area)
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QFrame.NoFrame)
-        scroll_area.setMinimumWidth(400)
+        sep = QFrame()
+        sep.setFixedHeight(2)
+        sep.setStyleSheet(
+            "background: qlineargradient(x0:0, y0:0, x1:1, y1:0, "
+            "stop:0 rgba(255,122,26,170), stop:1 rgba(255,122,26,0)); border: none;"
+        )
+        left_layout.addWidget(sep)
+        left_layout.addSpacing(8)
 
-        self.grid_container = QWidget()
-        self.grid_layout = QGridLayout(self.grid_container)
-        self.grid_layout.setAlignment(Qt.AlignTop)
-        self.grid_layout.setHorizontalSpacing(15)
-        self.grid_layout.setVerticalSpacing(8)
+        detail_scroll = QScrollArea()
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setStyleSheet("background: transparent; border: none;")
 
-        # Spalten-Verhältnis im Grid definieren
-        self.grid_layout.setColumnStretch(0, 0)
-        self.grid_layout.setColumnStretch(1, 1)
-        self.grid_layout.setColumnStretch(2, 0)
-        self.grid_layout.setColumnStretch(3, 1)
+        self.detail_grid_container = QWidget()
+        self.detail_grid_container.setStyleSheet("background: transparent;")
+        self.detail_grid_layout = QGridLayout(self.detail_grid_container)
+        self.detail_grid_layout.setAlignment(Qt.AlignTop)
+        self.detail_grid_layout.setHorizontalSpacing(20)
+        self.detail_grid_layout.setVerticalSpacing(8)
+        self.detail_grid_layout.setColumnStretch(0, 0)
+        self.detail_grid_layout.setColumnStretch(1, 1)
+        self.detail_grid_layout.setColumnStretch(2, 0)
+        self.detail_grid_layout.setColumnStretch(3, 1)
 
-        scroll_area.setWidget(self.grid_container)
-        self.content_splitter.addWidget(scroll_area)
+        detail_scroll.setWidget(self.detail_grid_container)
+        left_layout.addWidget(detail_scroll, 1)
 
-        # Bild Area
-        img_container = QWidget()
-        img_layout = QVBoxLayout(img_container)
-        img_layout.setContentsMargins(15, 0, 0, 0)
+        content_layout.addWidget(left_side, 3)
 
-        img_title = QLabel("Werkzeug-Abbildung")
-        img_title.setStyleSheet("font-weight: bold; color: #64748b; font-size: 11pt;")
+        right_side = QWidget()
+        right_side.setStyleSheet("background: transparent;")
+        right_side.setMaximumWidth(450)
+        right_side.setMinimumWidth(280)
+        right_layout = QVBoxLayout(right_side)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(12)
 
-        self.image_label = ResizableImageLabel()
-        self.image_label.setStyleSheet("border: 2px dashed #31363B; border-radius: 8px; background-color: #1e1e1e;")
-        self.image_label.setMinimumWidth(300)
+        img_header = QLabel("Abbildung")
+        img_header.setStyleSheet(
+            f"font-size: 12pt; color: {TEXT_SEC}; font-weight: bold; "
+            f"letter-spacing: 1px; background: transparent;"
+        )
+        right_layout.addWidget(img_header)
 
-        img_layout.addWidget(img_title)
-        img_layout.addWidget(self.image_label, 1)
-        self.content_splitter.addWidget(img_container)
+        img_frame = QFrame()
+        img_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {BG_PANEL_2};
+                border: 2px solid {BORDER};
+                border-radius: 16px;
+            }}
+        """)
+        img_frame_layout = QVBoxLayout(img_frame)
+        img_frame_layout.setContentsMargins(16, 16, 16, 16)
 
-        # Content Splitter: Text bekommt mehr Gewicht, Bild bleibt flexibel
-        self.content_splitter.setStretchFactor(0, 1)
-        self.content_splitter.setStretchFactor(1, 0)
+        self.image_widget = ResizableImageLabel()
+        self.image_widget.setMinimumSize(250, 250)
+        img_frame_layout.addWidget(self.image_widget, 1)
 
-        self.stacked_widget.addWidget(detail_widget)
+        right_layout.addWidget(img_frame, 1)
 
-        # Initiale Splitter-Größen (verhältnismäßiger)
-        self.splitter.setSizes([350, 850])
-        self.content_splitter.setSizes([550, 350])
+        content_layout.addWidget(right_side, 1)
 
-    # ----------------- DRAG & DROP -----------------
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls() and event.mimeData().urls()[0].isLocalFile():
-            path = event.mimeData().urls()[0].toLocalFile()
-            if path.lower().endswith('.gdml') or path.lower().endswith('.xml'):
-                event.acceptProposedAction()
+        detail_main_layout.addWidget(detail_content, 1)
 
-    def dropEvent(self, event: QDropEvent):
-        path = event.mimeData().urls()[0].toLocalFile()
-        self.load_gdml_file(path)
+        self.page_stack.addWidget(detail_page)
 
-    # ----------------- LOGIK -----------------
+    # ==================================================================
+    #  NAVIGATION
+    # ==================================================================
+    def _go_back(self):
+        self.page_stack.setCurrentIndex(0)
+        self.search_edit.setFocus()
+
+    def _show_tool_detail(self, tool):
+        self._render_tool_detail(tool)
+        self.page_stack.setCurrentIndex(1)
+
+    # ==================================================================
+    #  SUCHE
+    # ==================================================================
+    def _on_search_changed(self, text):
+        self._pending_query = text.strip()
+        if not self._pending_query:
+            self._search_timer.stop()
+            self._show_all_results()
+            return
+        self._search_timer.start()
+
+    def _run_pending_search(self):
+        query = self._pending_query
+        if not query:
+            return
+        tokens = query.split()
+        scored = []
+
+        for tool in self.all_tools:
+            total_score = 0
+            all_match = True
+            for token in tokens:
+                s = _token_score(tool, token)
+                if s <= 0:
+                    all_match = False
+                    break
+                total_score += s
+            if all_match:
+                scored.append((total_score, tool))
+
+        scored.sort(key=lambda pair: (-pair[0], natural_sort_key(pair[1].get('Werkzeugname', ''))))
+
+        self.filtered_tools = [t for _, t in scored]
+        self._display_results(self.filtered_tools)
+
+    def _show_all_results(self):
+        if self.all_tools:
+            self.subtitle_label.setText(f"{len(self.all_tools)} Werkzeuge geladen – tippe um zu filtern")
+            self._display_results(self.all_tools)
+        else:
+            self.subtitle_label.setText("Tippe um zu suchen – Ergebnisse erscheinen sofort")
+            self._display_results([])
+
+    # ==================================================================
+    #  KACHEL-GRID (Lazy Loading + responsive Spalten)
+    # ==================================================================
+    def _arrange_tiles(self):
+        """Ordnet alle Kacheln abhängig von der verfügbaren Breite an."""
+        vp_width = self.results_scroll.viewport().width() or 1200
+        cols = max(1, min(self.TILE_MAX_COLS,
+                          int((vp_width - 16) // (self.TILE_MIN_WIDTH + 14))))
+
+        grid = self.tiles_grid
+
+        # Grid leeren (Widgets bleiben erhalten)
+        while grid.count():
+            grid.takeAt(0)
+
+        # Alte Spalten-Stretches zurücksetzen
+        for c in range(self._grid_cols):
+            grid.setColumnStretch(c, 0)
+
+        for idx, tile in enumerate(self._tile_widgets):
+            r, c = divmod(idx, cols)
+            grid.addWidget(tile, r, c)
+
+        for c in range(cols):
+            grid.setColumnStretch(c, 1)
+
+        self._grid_cols = cols
+
+    def _display_results(self, tools):
+        self._current_results = tools
+        self._shown_count = 0
+
+        sb = self.results_scroll.verticalScrollBar()
+        sb.blockSignals(True)
+        self.results_body.setUpdatesEnabled(False)
+
+        self._clear_results()
+
+        count = len(tools)
+        self.results_info.setText(f"{count} Werkzeug{'e' if count != 1 else ''} gefunden")
+
+        batch = tools[:self.RESULT_BATCH]
+        self._create_tiles(batch)
+        self._shown_count = len(batch)
+        self._arrange_tiles()
+        self._update_footer()
+
+        self.results_body.setUpdatesEnabled(True)
+        sb.blockSignals(False)
+        sb.setValue(0)
+
+        QTimer.singleShot(0, self._ensure_scrollable)
+
+    def _create_tiles(self, batch):
+        for tool in batch:
+            tile = ToolTileWidget(tool)
+            tile.clicked.connect(self._show_tool_detail)
+            self._tile_widgets.append(tile)
+
+    def _append_results_batch(self):
+        total = len(self._current_results)
+        if self._shown_count >= total:
+            return
+
+        sb = self.results_scroll.verticalScrollBar()
+        sb.blockSignals(True)
+        self.results_body.setUpdatesEnabled(False)
+
+        batch = self._current_results[self._shown_count:self._shown_count + self.RESULT_BATCH]
+        self._create_tiles(batch)
+        self._shown_count += len(batch)
+        self._arrange_tiles()
+        self._update_footer()
+
+        self.results_body.setUpdatesEnabled(True)
+        sb.blockSignals(False)
+
+    def _ensure_scrollable(self):
+        sb = self.results_scroll.verticalScrollBar()
+        guard = 0
+        while (sb.maximum() == 0
+               and self._shown_count < len(self._current_results)
+               and guard < 30):
+            self._append_results_batch()
+            guard += 1
+
+    def _on_results_scrolled(self, value):
+        sb = self.results_scroll.verticalScrollBar()
+        if value >= sb.maximum() - 150:
+            self._append_results_batch()
+
+    def _update_footer(self):
+        remaining = len(self._current_results) - self._shown_count
+        if remaining > 0:
+            self.results_footer.setText(f"⬇  {remaining} weitere Werkzeuge – scrollen zum Laden")
+            self.results_footer.show()
+        else:
+            self.results_footer.setText("")
+
+    def _clear_results(self):
+        for tile in self._tile_widgets:
+            self.tiles_grid.removeWidget(tile)
+            tile.deleteLater()
+        self._tile_widgets.clear()
+
+    # ==================================================================
+    #  DATEI LADEN
+    # ==================================================================
     def _open_file_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "GDML-Datei auswählen", BASE_DIR, "GDML / XML Dateien (*.gdml *.xml);;Alle Dateien (*.*)"
@@ -615,13 +1260,12 @@ class MainWindow(QMainWindow):
     def load_gdml_file(self, path, initial=False):
         if not os.path.exists(path):
             if initial:
-                self.status_label.setText(f"Datei nicht gefunden:\n{os.path.basename(path)}")
+                self.subtitle_label.setText(f"⚠ Datei nicht gefunden: {os.path.basename(path)}")
             else:
                 QMessageBox.critical(self, "Fehler", f"Konnte die Datei nicht finden:\n{path}")
             return
 
         try:
-            # FIX: Zuerst als UTF-8 versuchen, dann Fallback auf ISO
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     content = f.read()
@@ -631,73 +1275,41 @@ class MainWindow(QMainWindow):
 
             filename = os.path.basename(path)
             tools = parse_gdml(content, filename)
-            tools.sort(key=lambda t: t.get('Werkzeugname', '').lower())
+            tools.sort(key=lambda t: natural_sort_key(t.get('Werkzeugname', '')))
 
             if not tools:
                 QMessageBox.warning(self, "Keine Daten", f"Keine Werkzeuge in {filename} gefunden.")
                 return
 
             self.all_tools = tools
-            self.status_label.setText(f"{len(tools)} Werkzeuge geladen")
+            self.subtitle_label.setText(f"{len(tools)} Werkzeuge geladen – tippe um zu filtern")
             self.search_edit.clear()
-            self._filter_tools()
+            self._display_results(tools)
+
+            self.page_stack.setCurrentIndex(0)
 
         except Exception as e:
             QMessageBox.critical(self, "Ladefehler", f"Fehler beim Lesen der GDML-Datei:\n{e}")
 
-    def _filter_tools(self):
-        query = self.search_edit.text().strip()
-        if not query:
-            self.filtered_tools = self.all_tools[:]
-        else:
-            tokens = query.split()
-            filtered = []
-            for tool in self.all_tools:
-                searchable = " ".join([
-                    tool.get('Werkzeugname', ''), tool.get('Durchmesser (mm)', ''),
-                    tool.get('Werkzeug-ID', ''), tool.get('Werkzeugnummer', ''),
-                    tool.get('Werkzeugtyp', ''), tool.get('Kommentar', ''), tool.get('Aufnahme', '')
-                ])
-                raw_comb = normalize_str(searchable)
-                clean_comb = clean_str(searchable)
+    # ==================================================================
+    #  DRAG & DROP
+    # ==================================================================
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls() and event.mimeData().urls()[0].isLocalFile():
+            path = event.mimeData().urls()[0].toLocalFile()
+            if path.lower().endswith('.gdml') or path.lower().endswith('.xml'):
+                event.acceptProposedAction()
 
-                match_all = True
-                for token in tokens:
-                    tn = normalize_str(token)
-                    tc = clean_str(token)
-                    if not (tn in raw_comb or (len(tc) > 0 and tc in clean_comb)):
-                        match_all = False
-                        break
-                if match_all:
-                    filtered.append(tool)
+    def dropEvent(self, event: QDropEvent):
+        path = event.mimeData().urls()[0].toLocalFile()
+        self.load_gdml_file(path)
 
-            self.filtered_tools = filtered
-
-        self.table.setRowCount(0)
-        for idx, tool in enumerate(self.filtered_tools):
-            self.table.insertRow(idx)
-            self.table.setItem(idx, 0, QTableWidgetItem(tool.get('Werkzeugname', '—')))
-            item_diam = QTableWidgetItem(tool.get('Durchmesser (mm)', '—'))
-            item_diam.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(idx, 1, item_diam)
-
-        if not self.filtered_tools:
-            self.stacked_widget.setCurrentIndex(0)
-        else:
-            self.table.selectRow(0)
-
-    def _on_table_selection_changed(self):
-        selected = self.table.selectedItems()
-        if not selected:
-            self.stacked_widget.setCurrentIndex(0)
-            return
-        row = selected[0].row()
-        if 0 <= row < len(self.filtered_tools):
-            self._render_tool_detail(self.filtered_tools[row])
-
+    # ==================================================================
+    #  BILD LADEN
+    # ==================================================================
     def _load_image(self, tool_name):
         if not tool_name or tool_name == '—':
-            self.image_label.set_placeholder("Kein Werkzeugname\ndefiniert.")
+            self.image_widget.set_placeholder()
             return
 
         extensions = [".png", ".jpg", ".jpeg", ".bmp"]
@@ -719,28 +1331,30 @@ class MainWindow(QMainWindow):
         if img_path:
             pixmap = QPixmap(img_path)
             if not pixmap.isNull():
-                self.image_label.set_image(pixmap)
+                self.image_widget.set_image(pixmap)
             else:
-                self.image_label.set_placeholder("Fehler beim Laden\ndes Bildes.")
+                self.image_widget.set_placeholder()
         else:
-            self.image_label.set_placeholder(
-                f"Kein Bild gefunden für:\n'{tool_name}'\n\nErwarteter Ordner:\n{IMAGE_DIR}")
+            self.image_widget.set_placeholder()
 
+    # ==================================================================
+    #  DETAIL-RENDERING
+    # ==================================================================
     def _render_tool_detail(self, tool):
-        self.stacked_widget.setCurrentIndex(1)
-
         tool_name = tool.get('Werkzeugname', 'Unbenanntes Werkzeug')
         self.detail_title.setText(tool_name)
         d = tool.get('Durchmesser (mm)', '—')
         typ = tool.get('Werkzeugtyp', '—')
-        self.detail_subtitle.setText(f"⌀ {d} mm  |  {typ}")
+        if d and d != '—':
+            self.detail_subtitle.setText(f"⌀ {d} mm  ·  {typ}")
+        else:
+            self.detail_subtitle.setText(f"{typ}")
 
         self._load_image(tool_name)
 
-        # Grid leeren
-        for i in reversed(range(self.grid_layout.count())):
-            widget = self.grid_layout.itemAt(i).widget()
-            if widget: widget.setParent(None)
+        for i in reversed(range(self.detail_grid_layout.count())):
+            widget = self.detail_grid_layout.itemAt(i).widget()
+            if widget: widget.deleteLater()
 
         categories = {
             'Basisdaten': ['Werkzeugnummer', 'Werkzeug-ID', 'Werkzeugname', 'Werkzeugtyp', 'Einheit', 'Kommentar'],
@@ -765,19 +1379,29 @@ class MainWindow(QMainWindow):
 
             if row > 0:
                 spacer = QFrame()
-                spacer.setFixedHeight(8)
-                self.grid_layout.addWidget(spacer, row, 0, 1, 4)
+                spacer.setFixedHeight(16)
+                spacer.setStyleSheet("background: transparent;")
+                self.detail_grid_layout.addWidget(spacer, row, 0, 1, 4)
                 row += 1
 
+            cat_frame = QFrame()
+            cat_frame.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {BG_PANEL_2};
+                    border-radius: 8px;
+                    padding: 4px;
+                }}
+            """)
+            cat_layout_h = QHBoxLayout(cat_frame)
+            cat_layout_h.setContentsMargins(12, 6, 12, 6)
             cat_label = QLabel(cat_name.upper())
-            cat_label.setStyleSheet("font-weight: bold; color: #448AFF; font-size: 10pt; letter-spacing: 1px;")
-            self.grid_layout.addWidget(cat_label, row, 0, 1, 4)
-            row += 1
-
-            line = QFrame()
-            line.setFrameShape(QFrame.HLine)
-            line.setStyleSheet("color: #31363B;")
-            self.grid_layout.addWidget(line, row, 0, 1, 4)
+            cat_label.setStyleSheet(
+                f"font-weight: bold; color: {BLUE}; font-size: 11pt; "
+                f"letter-spacing: 1.5px; background: transparent; border: none;"
+            )
+            cat_layout_h.addWidget(cat_label)
+            cat_layout_h.addStretch()
+            self.detail_grid_layout.addWidget(cat_frame, row, 0, 1, 4)
             row += 1
 
             for i in range(0, len(valid_fields), 2):
@@ -785,36 +1409,72 @@ class MainWindow(QMainWindow):
                 v1 = tool.get(f1, '—')
 
                 l1 = QLabel(f1)
-                l1.setStyleSheet("color: #94a3b8; font-size: 9pt;")
-                val1 = ElidedLabel(v1)
-                if v1 != '—':
-                    val1.setStyleSheet("font-weight: bold; color: white; font-size: 10pt;")
-                else:
-                    val1.setStyleSheet("color: #475569; font-size: 10pt;")
+                l1.setStyleSheet(
+                    f"color: {TEXT_SEC}; font-size: 11pt; background: transparent; "
+                    f"border: none; padding: 2px 0;"
+                )
+                l1.setWordWrap(True)
 
-                self.grid_layout.addWidget(l1, row, 0, alignment=Qt.AlignTop | Qt.AlignLeft)
-                self.grid_layout.addWidget(val1, row, 1, alignment=Qt.AlignTop | Qt.AlignLeft)
+                val1 = QLabel(str(v1))
+                if v1 != '—':
+                    val1.setStyleSheet(
+                        f"font-weight: 600; color: {TEXT_MAIN}; font-size: 13pt; "
+                        f"background: transparent; border: none; padding: 2px 0;"
+                    )
+                else:
+                    val1.setStyleSheet(
+                        "color: #475569; font-size: 13pt; background: transparent; "
+                        "border: none; padding: 2px 0;"
+                    )
+                val1.setWordWrap(True)
+                val1.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+                self.detail_grid_layout.addWidget(l1, row, 0, alignment=Qt.AlignTop | Qt.AlignLeft)
+                self.detail_grid_layout.addWidget(val1, row, 1, alignment=Qt.AlignTop | Qt.AlignLeft)
 
                 if i + 1 < len(valid_fields):
                     f2 = valid_fields[i + 1]
                     v2 = tool.get(f2, '—')
 
                     l2 = QLabel(f2)
-                    l2.setStyleSheet("color: #94a3b8; font-size: 9pt;")
-                    val2 = ElidedLabel(v2)
-                    if v2 != '—':
-                        val2.setStyleSheet("font-weight: bold; color: white; font-size: 10pt;")
-                    else:
-                        val2.setStyleSheet("color: #475569; font-size: 10pt;")
+                    l2.setStyleSheet(
+                        f"color: {TEXT_SEC}; font-size: 11pt; background: transparent; "
+                        f"border: none; padding: 2px 0;"
+                    )
+                    l2.setWordWrap(True)
 
-                    self.grid_layout.addWidget(l2, row, 2, alignment=Qt.AlignTop | Qt.AlignLeft)
-                    self.grid_layout.addWidget(val2, row, 3, alignment=Qt.AlignTop | Qt.AlignLeft)
+                    val2 = QLabel(str(v2))
+                    if v2 != '—':
+                        val2.setStyleSheet(
+                            f"font-weight: 600; color: {TEXT_MAIN}; font-size: 13pt; "
+                            f"background: transparent; border: none; padding: 2px 0;"
+                        )
+                    else:
+                        val2.setStyleSheet(
+                            "color: #475569; font-size: 13pt; background: transparent; "
+                            "border: none; padding: 2px 0;"
+                        )
+                    val2.setWordWrap(True)
+                    val2.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+                    self.detail_grid_layout.addWidget(l2, row, 2, alignment=Qt.AlignTop | Qt.AlignLeft)
+                    self.detail_grid_layout.addWidget(val2, row, 3, alignment=Qt.AlignTop | Qt.AlignLeft)
 
                 row += 1
+
+        bottom_spacer = QFrame()
+        bottom_spacer.setFixedHeight(30)
+        bottom_spacer.setStyleSheet("background: transparent;")
+        self.detail_grid_layout.addWidget(bottom_spacer, row, 0, 1, 4)
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    # High-DPI Support
+    app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
