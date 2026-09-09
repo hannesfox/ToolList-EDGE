@@ -20,7 +20,10 @@ from PyQt5.QtGui import (
     QIcon, QPixmap, QDragEnterEvent, QDropEvent, QPainter, QColor, QPen,
     QFont, QLinearGradient, QPainterPath, QFontDatabase
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPoint, QEvent
+from PyQt5.QtCore import (
+    Qt, pyqtSignal, QTimer, QPoint, QEvent,
+    QPropertyAnimation, QEasingCurve, pyqtProperty
+)
 
 # qt_material-Warnings ("must be imported after...", "QFontDatabase") unterdrücken
 _log_level_backup = logging.root.level
@@ -33,17 +36,33 @@ logging.root.setLevel(_log_level_backup)
 #      KONFIGURATION & PFADE
 # ==============================================================================
 def get_base_dir():
+    """Ermittelt das Basisverzeichnis. Funktioniert sowohl im Python-Modus als auch in der PyInstaller .exe"""
     if getattr(sys, 'frozen', False):
+        # Wir befinden uns in einer kompilierten .exe
         return os.path.dirname(sys.executable)
+    # Wir befinden uns im normalen Python-Entwicklungsmodus
     return os.path.dirname(os.path.abspath(__file__))
 
 
 BASE_DIR = get_base_dir()
-DEFAULT_FILE_PATH = os.path.join(BASE_DIR, "EDGE-Werkzeugliste-2026.gdml")
-IMAGE_DIR = os.path.join(BASE_DIR, "images")
+
+# Definiere deine spezifischen lokalen Pfade (Raw-String 'r' verwenden wegen Backslashes!)
+LOCAL_GDML_PATH = r"G:\Software - Install\Gschwendtner\testordner-edge-wkz\EDGE-Werkzeugliste-2026.gdml"
+LOCAL_IMAGE_DIR = r"G:\Software - Install\Gschwendtner\testordner-edge-wkz\images"
+
+# Intelligente Pfad-Zuweisung:
+# 1. Prüfe, ob wir auf deinem Entwicklungsrechner sind (G:\ existiert und Datei ist da)
+if os.path.exists(LOCAL_GDML_PATH):
+    DEFAULT_FILE_PATH = LOCAL_GDML_PATH
+    IMAGE_DIR = LOCAL_IMAGE_DIR
+else:
+    # 2. Fallback für die .exe oder andere Rechner: Suche im gleichen Ordner wie die .exe
+    DEFAULT_FILE_PATH = os.path.join(BASE_DIR, "EDGE-Werkzeugliste-2026.gdml")
+    IMAGE_DIR = os.path.join(BASE_DIR, "images")
 
 
 def resource_path(relative_path: str) -> str:
+    """Hilfsfunktion für Ressourcen, die in die .exe eingebettet sind (z.B. Logo)"""
     try:
         base_path = sys._MEIPASS
     except Exception:
@@ -54,17 +73,17 @@ def resource_path(relative_path: str) -> str:
 # ==============================================================================
 #      FARBPALETTE: BLAUES BASIS-DESIGN + ORANGE AKZENTE
 # ==============================================================================
-BLUE          = "#448AFF"
-BLUE_BRIGHT   = "#82B1FF"
-ORANGE        = "#FF7A1A"
+BLUE = "#448AFF"
+BLUE_BRIGHT = "#82B1FF"
+ORANGE = "#FF7A1A"
 ORANGE_BRIGHT = "#FFA050"
-BG_BASE       = "#0f1419"
-BG_PANEL      = "#1e2433"
-BG_PANEL_2    = "#141b24"
-BORDER        = "#2d3748"
-TEXT_MAIN     = "#e2e8f0"
-TEXT_SEC      = "#64748b"
-TEXT_MUTED    = "#475569"
+BG_BASE = "#0f1419"
+BG_PANEL = "#1e2433"
+BG_PANEL_2 = "#141b24"
+BORDER = "#2d3748"
+TEXT_MAIN = "#e2e8f0"
+TEXT_SEC = "#64748b"
+TEXT_MUTED = "#475569"
 
 
 # ==============================================================================
@@ -102,13 +121,20 @@ def natural_sort_key(s):
 
 def parse_technology_block(text):
     result = {}
+    string_refs = {}  # NEU: Feldname -> String-ID (z.B. Comment -> "7")
     lines = text.splitlines()
     string_keys = []
     for line in lines:
         line = line.strip()
         if not line: continue
         m = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s*;\s*(\d+)\s*;\s*([^;]*)\s*;", line)
-        if m: result[m.group(1)] = m.group(3).strip()
+        if m:
+            field, sid, val = m.group(1), m.group(2), m.group(3).strip()
+            if val:
+                result[field] = val
+            else:
+                # Wert leer -> Verweis auf einen BEGIN_STRING-Block (z.B. "Comment; 7; ; ...")
+                string_refs[field] = sid
         if line.startswith('BEGIN_STRING;'):
             parts = line.split(';')
             if len(parts) >= 2: string_keys.append(parts[1].strip())
@@ -121,6 +147,10 @@ def parse_technology_block(text):
             if start != -1 and end != -1:
                 val = text[start + 1:end].strip()
                 result[key] = val if val != '' else '—'
+    # NEU: String-Referenzen auflösen (z.B. Comment -> String 7 -> "kommentarfeld")
+    for field, sid in string_refs.items():
+        resolved = result.get(sid, '')
+        result[field] = resolved if resolved not in ('', None) else '—'
     return result
 
 
@@ -161,7 +191,7 @@ def parse_gdml(xml_content, filename):
             assembly_map.setdefault(m.group(1), {})['stationId'] = text
 
     cutter_to_holder = {}
-    node_file_map = {}   # PERFORMANCE: newNodeName -> componentFile nur EINMAL durchlaufen
+    node_file_map = {}  # PERFORMANCE: newNodeName -> componentFile nur EINMAL durchlaufen
     for comp in comps:
         file_attr = comp.attrib.get('componentFile', '')
         new_node = comp.attrib.get('newNodeName', '')
@@ -356,6 +386,111 @@ def add_glow(widget, color=QColor(255, 122, 26), blur=30, alpha=90):
 
 
 # ==============================================================================
+#      FARB-INTERPOLATION FÜR ANIMATIONEN
+# ==============================================================================
+def _lerp_color(c1: QColor, c2: QColor, t: float) -> QColor:
+    """Mischt zwei Farben linear (t = 0.0 .. 1.0)."""
+    return QColor(
+        int(c1.red()   + (c2.red()   - c1.red())   * t),
+        int(c1.green() + (c2.green() - c1.green()) * t),
+        int(c1.blue()  + (c2.blue()  - c1.blue())  * t),
+    )
+
+
+# ==============================================================================
+#      ANIMIERTES SUCHFELD
+#      - Placeholder verschwindet bei Fokus
+#      - Weißer blinkender Cursor
+#      - Pulsierender Glow + Rahmenfarbe animiert sich solange fokussiert
+# ==============================================================================
+class AnimatedSearchEdit(QLineEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._saved_placeholder = ""
+        self._last_step = -1
+
+        # Endlose Puls-Animation (Property-Wert 0.0 -> 1.0, wird intern zu Sinus-Welle)
+        self._anim = QPropertyAnimation(self, b"pulseLevel")
+        self._anim.setDuration(1600)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setLoopCount(-1)  # endlos
+        self._anim.setEasingCurve(QEasingCurve.Linear)  # Sinus-Mapping passiert im Setter
+
+    # ----- Animations-Property -----
+    def _get_pulse(self):
+        return 0.0
+
+    def _set_pulse(self, value):
+        # Aus dem linearen 0->1 Loop eine sanfte Sinuswelle 0->1->0 machen (kein Sprung am Loop-Ende)
+        t = 0.5 - 0.5 * math.cos(2 * math.pi * value)
+        self._apply_focus_fx(t)
+
+    pulseLevel = pyqtProperty(float, fget=_get_pulse, fset=_set_pulse)
+
+    # ----- Fokus-Events -----
+    def focusInEvent(self, event):
+        # Placeholder merken und ausblenden -> Feld wirkt sofort "aktiv"
+        self._saved_placeholder = self.placeholderText()
+        self.setPlaceholderText("")
+
+        # Puls-Animation starten
+        self._anim.stop()
+        self._anim.start()
+
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event):
+        # Animation stoppen und Effekt zurücksetzen
+        self._anim.stop()
+        self._last_step = -1
+
+        eff = self.graphicsEffect()
+        if eff:
+            eff.setBlurRadius(24)
+
+        # Widget-Stylesheet löschen -> globales (Unfokussiert-)Design greift wieder
+        self.setStyleSheet("")
+
+        # Placeholder wiederherstellen, wenn nichts eingegeben wurde
+        if not self.text():
+            self.setPlaceholderText(self._saved_placeholder)
+
+        super().focusOutEvent(event)
+
+    # ----- Visueller Effekt pro Animations-Frame -----
+    def _apply_focus_fx(self, t):
+        # 1) Glow pulsieren lassen (günstig, ohne Stylesheet-Update)
+        eff = self.graphicsEffect()
+        if eff:
+            eff.setBlurRadius(int(22 + 20 * t))
+
+        # 2) Rahmenfarbe sanft zwischen Blau und Hellblau pendeln.
+        #    Stylesheet nur bei sichtbarer Änderung updaten (Performance!)
+        step = int(round(t * 10))
+        if step == self._last_step:
+            return
+        self._last_step = step
+
+        border = _lerp_color(QColor(BLUE), QColor(BLUE_BRIGHT), step / 10.0)
+
+        self.setStyleSheet(f"""
+            QLineEdit {{
+                padding: 16px 20px;
+                border: 2px solid {border.name()};
+                border-radius: 16px;
+                background-color: #1e2a3a;
+                font-size: 16pt;
+                color: #ffffff;
+                selection-background-color: {BLUE};
+            }}
+            QLineEdit::placeholder {{
+                color: {TEXT_MUTED};
+            }}
+        """)
+
+
+# ==============================================================================
 #      PLATZHALTER-ICON (Detailseite, kein Text)
 # ==============================================================================
 class PlaceholderIconWidget(QWidget):
@@ -414,11 +549,11 @@ class PlaceholderIconWidget(QWidget):
 
 
 # ==============================================================================
-#      BILD-WIDGET (Detailseite)
+#      BILD-WIDGET (Detailseite) - ANGEPASST FÜR WERKZEUGBILDER
 # ==============================================================================
 class ResizableImageLabel(QWidget):
     def __init__(self, parent=None):
-        super().__init__(parent)
+        super().__init__()
         self._pixmap = None
         self._show_placeholder = True
         self._placeholder_widget = None
@@ -428,11 +563,13 @@ class ResizableImageLabel(QWidget):
     def _setup_ui(self):
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(0)
 
         self._placeholder_widget = PlaceholderIconWidget()
         self._image_label = QLabel()
         self._image_label.setAlignment(Qt.AlignCenter)
         self._image_label.setScaledContents(False)
+        self._image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self._layout.addWidget(self._placeholder_widget)
         self._layout.addWidget(self._image_label)
@@ -457,11 +594,29 @@ class ResizableImageLabel(QWidget):
 
     def _update_image(self):
         if self._pixmap and not self._pixmap.isNull() and not self._show_placeholder:
-            available = self._image_label.size()
+            available = self.size()
             if available.width() > 0 and available.height() > 0:
-                scaled = self._pixmap.scaled(
-                    available, Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
+                # Berechne optimales Scaling für Werkzeugbilder (oft hochformatig)
+                pixmap_ratio = self._pixmap.width() / self._pixmap.height()
+                available_ratio = available.width() / available.height()
+
+                if pixmap_ratio > available_ratio:
+                    # Bild ist breiter als verfügbar -> nach Breite skalieren
+                    scaled = self._pixmap.scaled(
+                        available.width(),
+                        int(available.width() / pixmap_ratio),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    )
+                else:
+                    # Bild ist höher als verfügbar -> nach Höhe skalieren
+                    scaled = self._pixmap.scaled(
+                        int(available.height() * pixmap_ratio),
+                        available.height(),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    )
+
                 self._image_label.setPixmap(scaled)
 
 
@@ -527,7 +682,7 @@ class ToolTileWidget(QFrame):
 # ==============================================================================
 class MainWindow(QMainWindow):
     RESULT_BATCH = 60
-    TILE_MIN_WIDTH = 250    # Mindestbreite einer Kachel -> bestimmt Spaltenanzahl
+    TILE_MIN_WIDTH = 250  # Mindestbreite einer Kachel -> bestimmt Spaltenanzahl
     TILE_MAX_COLS = 6
 
     def __init__(self):
@@ -551,9 +706,10 @@ class MainWindow(QMainWindow):
         self._shown_count = 0
         self._pending_query = ""
         self._grid_cols = 0
+        self.source_badge = None  # Referenz für das Quellen-Badge
 
         # ---------- Glow-Puls (Timer-basiert, kompatibel mit allen PyQt5-Versionen) ----------
-        self._glow_targets = []   # [effect, lo, hi, speed, phase]
+        self._glow_targets = []  # [effect, lo, hi, speed, phase]
         self._glow_t = 0.0
         self._glow_timer = QTimer(self)
         self._glow_timer.setInterval(40)
@@ -610,6 +766,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _set_application_style(self):
         app = QApplication.instance()
+        app.setCursorFlashTime(900)  # sichtbares, angenehmes Cursor-Blinken
 
         fallback_font = "Helvetica" if sys.platform == "darwin" else "Segoe UI"
         extra = {
@@ -771,7 +928,7 @@ class MainWindow(QMainWindow):
         top_layout.setContentsMargins(40, 24, 40, 16)
         top_layout.setSpacing(0)
 
-        # ---------- Header Zeile 1: Titel (OHNE Symbol) + Button ----------
+        # ---------- Header Zeile 1: Titel + (Stretch) + Quelle-Badge + Button ----------
         header_row = QHBoxLayout()
         header_row.setSpacing(12)
 
@@ -780,7 +937,25 @@ class MainWindow(QMainWindow):
             f"font-size: 18pt; font-weight: bold; color: {BLUE}; background: transparent;"
         )
         header_row.addWidget(title_label)
+
+        # Stretch drückt alles folgende nach rechts
         header_row.addStretch()
+
+        # Datenquellen-Indicator – RECHTS neben dem Button
+        self.source_badge = QLabel("💾 Interner Speicher")
+        self.source_badge.setStyleSheet(f"""
+            QLabel {{
+                background-color: {BG_PANEL};
+                color: {ORANGE};
+                border: 1px solid {ORANGE};
+                border-radius: 6px;
+                padding: 4px 12px;
+                font-size: 9pt;
+                font-weight: bold;
+            }}
+        """)
+        self.source_badge.setToolTip("Zeigt an, woher die aktuellen Werkzeugdaten geladen werden.")
+        header_row.addWidget(self.source_badge)
 
         btn_open = QPushButton("📁 Datei öffnen")
         btn_open.setStyleSheet(f"""
@@ -846,7 +1021,7 @@ class MainWindow(QMainWindow):
         search_wrapper_layout = QHBoxLayout(search_wrapper)
         search_wrapper_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.search_edit = QLineEdit()
+        self.search_edit = AnimatedSearchEdit()
         self.search_edit.setPlaceholderText("🔍  Werkzeugname, Durchmesser, ID, Typ...")
         self.search_edit.setMinimumHeight(68)
         self.search_edit.textChanged.connect(self._on_search_changed)
@@ -921,7 +1096,7 @@ class MainWindow(QMainWindow):
         self.page_stack.addWidget(home_page)
 
     # ------------------------------------------------------------------
-    #  DETAILSEITE
+    #  DETAILSEITE - ANGEPASST FÜR WERKZEUGBILDER
     # ------------------------------------------------------------------
     def _build_detail_page(self):
         detail_page = QWidget()
@@ -969,7 +1144,7 @@ class MainWindow(QMainWindow):
                 border: 2px solid {ORANGE};
             }}
         """)
-        add_glow(self.btn_back, QColor(255, 122, 26), blur=26, alpha=70)  # oranger Glut-Schein
+        add_glow(self.btn_back, QColor(255, 122, 26), blur=26, alpha=70)
         self.btn_back.clicked.connect(self._go_back)
         row1.addWidget(self.btn_back)
         row1.addStretch()
@@ -989,15 +1164,19 @@ class MainWindow(QMainWindow):
         # ---------- Detail-Content ----------
         detail_content = QWidget()
         detail_content.setStyleSheet("background: transparent;")
-        content_layout = QHBoxLayout(detail_content)
+        content_layout = QVBoxLayout(detail_content)
         content_layout.setContentsMargins(30, 20, 30, 20)
-        content_layout.setSpacing(30)
+        content_layout.setSpacing(15)
 
-        left_side = QWidget()
-        left_side.setStyleSheet("background: transparent;")
-        left_layout = QVBoxLayout(left_side)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(8)
+        # ---------- OBERE ZEILE: Titel und Subtitle ----------
+        title_row = QHBoxLayout()
+        title_row.setSpacing(15)
+
+        left_header = QWidget()
+        left_header.setStyleSheet("background: transparent;")
+        left_header_layout = QVBoxLayout(left_header)
+        left_header_layout.setContentsMargins(0, 0, 0, 0)
+        left_header_layout.setSpacing(5)
 
         self.detail_title = QLabel("Werkzeug")
         self.detail_title.setStyleSheet(
@@ -1005,7 +1184,7 @@ class MainWindow(QMainWindow):
         )
         self.detail_title.setWordWrap(True)
         add_glow(self.detail_title, QColor(68, 138, 255), blur=28, alpha=60)
-        left_layout.addWidget(self.detail_title)
+        left_header_layout.addWidget(self.detail_title)
 
         self.detail_subtitle = QLabel("")
         self.detail_subtitle.setStyleSheet(f"""
@@ -1017,18 +1196,49 @@ class MainWindow(QMainWindow):
                 padding: 4px 0;
             }}
         """)
-        left_layout.addWidget(self.detail_subtitle)
+        left_header_layout.addWidget(self.detail_subtitle)
+        left_header_layout.addStretch()
 
-        left_layout.addSpacing(8)
+        title_row.addWidget(left_header, 3)
 
+        # Bild-Header rechts oben (kleiner)
+        right_header = QWidget()
+        right_header.setStyleSheet("background: transparent;")
+        right_header_layout = QVBoxLayout(right_header)
+        right_header_layout.setContentsMargins(0, 0, 0, 0)
+
+        img_header = QLabel("Abbildung")
+        img_header.setStyleSheet(
+            f"font-size: 12pt; color: {TEXT_SEC}; font-weight: bold; "
+            f"letter-spacing: 1px; background: transparent;"
+        )
+        right_header_layout.addWidget(img_header)
+        right_header_layout.addStretch()
+
+        title_row.addWidget(right_header, 1)
+
+        content_layout.addLayout(title_row)
+
+        # ---------- ORANGENER TRENNSTRICH (über gesamte Breite) ----------
         sep = QFrame()
         sep.setFixedHeight(2)
         sep.setStyleSheet(
             "background: qlineargradient(x0:0, y0:0, x1:1, y1:0, "
             "stop:0 rgba(255,122,26,170), stop:1 rgba(255,122,26,0)); border: none;"
         )
-        left_layout.addWidget(sep)
-        left_layout.addSpacing(8)
+        content_layout.addWidget(sep)
+        content_layout.addSpacing(10)
+
+        # ---------- UNTERE ZEILE: Daten (links) + Bild (rechts) ----------
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(30)
+
+        # Linke Seite: Scrollbare Daten
+        left_side = QWidget()
+        left_side.setStyleSheet("background: transparent;")
+        left_layout = QVBoxLayout(left_side)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
 
         detail_scroll = QScrollArea()
         detail_scroll.setWidgetResizable(True)
@@ -1048,22 +1258,16 @@ class MainWindow(QMainWindow):
         detail_scroll.setWidget(self.detail_grid_container)
         left_layout.addWidget(detail_scroll, 1)
 
-        content_layout.addWidget(left_side, 3)
+        bottom_row.addWidget(left_side, 3)
 
+        # Rechte Seite: Bild
         right_side = QWidget()
         right_side.setStyleSheet("background: transparent;")
-        right_side.setMaximumWidth(450)
-        right_side.setMinimumWidth(280)
+        right_side.setMinimumWidth(300)
+        right_side.setMaximumWidth(500)
         right_layout = QVBoxLayout(right_side)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(12)
-
-        img_header = QLabel("Abbildung")
-        img_header.setStyleSheet(
-            f"font-size: 12pt; color: {TEXT_SEC}; font-weight: bold; "
-            f"letter-spacing: 1px; background: transparent;"
-        )
-        right_layout.addWidget(img_header)
+        right_layout.setSpacing(0)
 
         img_frame = QFrame()
         img_frame.setStyleSheet(f"""
@@ -1074,19 +1278,53 @@ class MainWindow(QMainWindow):
             }}
         """)
         img_frame_layout = QVBoxLayout(img_frame)
-        img_frame_layout.setContentsMargins(16, 16, 16, 16)
+        img_frame_layout.setContentsMargins(12, 12, 12, 12)
 
         self.image_widget = ResizableImageLabel()
-        self.image_widget.setMinimumSize(250, 250)
+        self.image_widget.setStyleSheet("background-color: #f0f0f0;")
+        self.image_widget.setMinimumSize(280, 350)
+        self.image_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         img_frame_layout.addWidget(self.image_widget, 1)
 
         right_layout.addWidget(img_frame, 1)
 
-        content_layout.addWidget(right_side, 1)
+        bottom_row.addWidget(right_side, 1)
+
+        content_layout.addLayout(bottom_row, 1)
 
         detail_main_layout.addWidget(detail_content, 1)
 
         self.page_stack.addWidget(detail_page)
+
+    # ------------------------------------------------------------------
+    #  DATENQUELLE-INDIKATOR AKTUALISIEREN
+    # ------------------------------------------------------------------
+    def _update_source_indicator(self, path):
+        r"""Aktualisiert das Badge, je nachdem ob die Datei vom Server (G:\) oder lokal kommt."""
+        if not self.source_badge:
+            return
+
+        # Prüfe, ob der geladene Pfad dem definierten Server/Laufwerk-Pfad entspricht
+        if os.path.abspath(path) == os.path.abspath(LOCAL_GDML_PATH):
+            text = "🌐 Server / Zentral"
+            color = BLUE  # Blau für zentrale/vertrauenswürdige Quelle
+        else:
+            text = "💾 Interner Speicher"
+            color = ORANGE  # Orange für lokalen Fallback oder manuell geöffnete Datei
+
+        self.source_badge.setText(text)
+        self.source_badge.setStyleSheet(f"""
+            QLabel {{
+                background-color: {BG_PANEL};
+                color: {color};
+                border: 1px solid {color};
+                border-radius: 6px;
+                padding: 4px 12px;
+                font-size: 9pt;
+                font-weight: bold;
+            }}
+        """)
+        self.source_badge.setToolTip(f"Aktuelle Datenquelle:\n{path}")
 
     # ==================================================================
     #  NAVIGATION
@@ -1281,6 +1519,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Keine Daten", f"Keine Werkzeuge in {filename} gefunden.")
                 return
 
+            # UI-Indicator aktualisieren!
+            self._update_source_indicator(path)
+
             self.all_tools = tools
             self.subtitle_label.setText(f"{len(tools)} Werkzeuge geladen – tippe um zu filtern")
             self.search_edit.clear()
@@ -1357,10 +1598,11 @@ class MainWindow(QMainWindow):
             if widget: widget.deleteLater()
 
         categories = {
-            'Basisdaten': ['Werkzeugnummer', 'Werkzeug-ID', 'Werkzeugname', 'Werkzeugtyp', 'Einheit', 'Kommentar'],
+            'Basisdaten': ['Werkzeugnummer', 'Werkzeug-ID', 'Werkzeugname', 'Werkzeugtyp', 'Einheit'],
             'Geometrie': ['Durchmesser (mm)', 'Schneidenlänge (mm)', 'Gesamtlänge (mm)', 'Ausspannlänge (mm)',
                           'Schaftdurchmesser (mm)', 'Oberer Schaftdurchmesser (mm)', 'Untere Länge (mm)',
                           'Schaftwinkel (°)', 'Halterdurchmesser (mm)', 'Anzahl Schneiden'],
+            'Kommentar': ['Kommentar'],
             'Aufnahme & Halter': ['Aufnahme', 'Aufnahmegröße', 'Baugruppe', 'Baugruppentyp', 'Root-ID', 'Station-ID'],
             'Maschinenparameter': ['Längenkorrekturregister', 'Spindeldrehrichtung', 'Werkzeugausrichtung',
                                    'Schutzebene (mm)'],
@@ -1430,9 +1672,11 @@ class MainWindow(QMainWindow):
                 val1.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
                 self.detail_grid_layout.addWidget(l1, row, 0, alignment=Qt.AlignTop | Qt.AlignLeft)
-                self.detail_grid_layout.addWidget(val1, row, 1, alignment=Qt.AlignTop | Qt.AlignLeft)
 
                 if i + 1 < len(valid_fields):
+                    # Normaler Fall: Zwei Felder nebeneinander
+                    self.detail_grid_layout.addWidget(val1, row, 1, alignment=Qt.AlignTop | Qt.AlignLeft)
+
                     f2 = valid_fields[i + 1]
                     v2 = tool.get(f2, '—')
 
@@ -1459,6 +1703,9 @@ class MainWindow(QMainWindow):
 
                     self.detail_grid_layout.addWidget(l2, row, 2, alignment=Qt.AlignTop | Qt.AlignLeft)
                     self.detail_grid_layout.addWidget(val2, row, 3, alignment=Qt.AlignTop | Qt.AlignLeft)
+                else:
+                    # Einzelfeld (z.B. Kommentar): Wert spannt über die volle Restbreite
+                    self.detail_grid_layout.addWidget(val1, row, 1, 1, 3, Qt.AlignTop | Qt.AlignLeft)
 
                 row += 1
 
